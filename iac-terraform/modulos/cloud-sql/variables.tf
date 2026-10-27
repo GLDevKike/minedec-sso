@@ -23,6 +23,12 @@ variable "tier" {
   description = "Tipo de máquina (ej: db-f1-micro, db-g1-small, db-n1-standard-2, db-custom-4-15360)"
 }
 
+variable "edition" {
+  type        = string
+  default     = "ENTERPRISE"
+  description = "Edición de Cloud SQL: ENTERPRISE (soporta db-f1-micro, db-g1-small, db-custom-*) o ENTERPRISE_PLUS"
+}
+
 variable "availability_type" {
   type        = string
   default     = "REGIONAL"
