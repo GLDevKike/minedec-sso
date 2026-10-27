@@ -128,6 +128,7 @@ cloudsql_tier                   = "db-f1-micro"
 cloudsql_availability_type      = "ZONAL"
 cloudsql_disk_size_gb           = 10
 cloudsql_disk_type              = "PD_SSD"
+cloudsql_allocated_ip_range     = "psa-sso-sql-des"
 cloudsql_use_private_network    = true
 cloudsql_ipv4_enabled           = false
 cloudsql_deletion_protection    = false

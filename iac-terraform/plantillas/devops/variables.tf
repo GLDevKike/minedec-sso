@@ -50,7 +50,7 @@ variable "enable_host_iam" {
 }
 
 variable "enable_local_vpc" {
-  description = "Aprovisiona una VPC local autónoma con los 3 segmentos oficiales (/23 dividido en 2x/24 para subred primaria + PSA, /24 para services y /20 para pods) cuando aún no se utiliza la Shared VPC externa."
+  description = "Aprovisiona una VPC local autónoma con los 3 segmentos oficiales (/24 para subred primaria snet-sso-ue1, /23 dividido en 2x/24 para Private Services Access de Cloud SQL/AlloyDB + Redis, y /20 dividido en 2x/21 para GKE pods + services) cuando aún no se utiliza la Shared VPC externa."
   type        = bool
   default     = false
 }
@@ -58,19 +58,22 @@ variable "enable_local_vpc" {
 variable "local_vpc" {
   description = "Configuración de la VPC local usando exclusivamente los 3 segmentos oficiales de red (/20, /23, /24). Solo aplica si enable_local_vpc = true."
   type = object({
-    network_name        = optional(string, "vpc-mec-sha-des")
-    routing_mode        = optional(string, "REGIONAL")
-    subnet_name         = optional(string, "snet-sso-ue1")
-    subnet_cidr         = optional(string, "10.10.0.0/24")
-    pods_range_name     = optional(string, "pods")
-    pods_cidr           = optional(string, "10.10.16.0/20")
-    services_range_name = optional(string, "services")
-    services_cidr       = optional(string, "10.10.2.0/24")
-    psa_range_name      = optional(string, "psa-sso-des")
-    psa_address         = optional(string, "10.10.1.0")
-    psa_prefix_length   = optional(number, 24)
-    router_name         = optional(string, "rtr-sso-des-ue1")
-    nat_name            = optional(string, "nat-sso-des-ue1")
+    network_name          = optional(string, "vpc-mec-sha-des")
+    routing_mode          = optional(string, "REGIONAL")
+    subnet_name           = optional(string, "snet-sso-ue1")
+    subnet_cidr           = optional(string, "10.10.2.0/24")
+    pods_range_name       = optional(string, "pods")
+    pods_cidr             = optional(string, "10.10.16.0/21")
+    services_range_name   = optional(string, "services")
+    services_cidr         = optional(string, "10.10.24.0/21")
+    psa_range_name        = optional(string, "psa-sso-des")
+    psa_address           = optional(string, "10.10.1.0")
+    psa_prefix_length     = optional(number, 24)
+    psa_sql_range_name    = optional(string, "psa-sso-sql-des")
+    psa_sql_address       = optional(string, "10.10.0.0")
+    psa_sql_prefix_length = optional(number, 24)
+    router_name           = optional(string, "rtr-sso-des-ue1")
+    nat_name              = optional(string, "nat-sso-des-ue1")
   })
   default = null
 }

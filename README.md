@@ -261,9 +261,9 @@ La red del Subcomponente C2.2 utiliza **única y exclusivamente 3 segmentos de r
 
 | Máscara Oficial | Bloque Asignado | Subdivisión / Uso en la Arquitectura GCP |
 |-----------------|-----------------|------------------------------------------|
-| **`/20`** (`4 096` IPs) | `10.10.16.0/20` | **Rango secundario `pods`** de la subred `snet-sso-ue1` para todos los Pods de GKE (`sso-oidc`, `motor-pdp`, `api-pap`, `frontend`, `pip-identity-service`). |
-| **`/24`** (`256` IPs) | `10.10.2.0/24` | **Rango secundario `services`** de la subred `snet-sso-ue1` para los `ClusterIP` Services de GKE. |
-| **`/23`** (`512` IPs) | `10.10.0.0/23` | Subdividido de forma contigua y sin traslape en dos mitades `/24`:<br>• **1.ª mitad (`10.10.0.0/24`)**: Rango primario de la subred `snet-sso-ue1` (nodos GKE, Internal Load Balancers y Cloud Run Direct VPC Egress).<br>• **2.ª mitad (`10.10.1.0/24`)**: Rango reservado `psa-sso-<ambiente>` para **Private Services Access** (`servicenetworking.googleapis.com`, donde reciben IP privada Cloud SQL / AlloyDB y Memorystore Redis). |
+| **`/24`** (`256` IPs) | `10.10.2.0/24` | **Rango primario** de la subred `snet-sso-ue1` (nodos GKE, Internal Load Balancers y Cloud Run Direct VPC Egress). |
+| **`/23`** (`512` IPs) | `10.10.0.0/23` | Dedicado a **Private Services Access** (`servicenetworking.googleapis.com`) y subdividido de forma contigua en sus dos mitades `/24`:<br>• **1.ª mitad (`10.10.0.0/24`, `psa-sso-sql-<ambiente>`)**: Rango exclusivo para Cloud SQL / AlloyDB for PostgreSQL 16 (que exige un bloque `/24` íntegro en GCP).<br>• **2.ª mitad (`10.10.1.0/24`, `psa-sso-<ambiente>`)**: Rango para Memorystore for Redis (`PRIVATE_SERVICE_ACCESS`, compatible con Shared VPC). |
+| **`/20`** (`4 096` IPs) | `10.10.16.0/20` | Dedicado a los **rangos secundarios de GKE** en la subred `snet-sso-ue1` y subdividido de forma contigua en sus dos mitades `/21`:<br>• **1.ª mitad (`10.10.16.0/21`, `2 048` IPs)**: Rango secundario `pods` (`sso-oidc`, `motor-pdp`, `api-pap`, `frontend`, `pip-identity-service`).<br>• **2.ª mitad (`10.10.24.0/21`, `2 048` IPs)**: Rango secundario `services` (`ClusterIP` Services de GKE). |
 
 ### 6.2 Configuración FinOps Temporal en Desarrollo (`mec-003-sso-des`)
 

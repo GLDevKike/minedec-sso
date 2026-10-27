@@ -27,7 +27,7 @@ module "local_vpc" {
   project_id   = var.project_id
   name         = var.local_vpc.network_name
   routing_mode = var.local_vpc.routing_mode
-  description  = "VPC local para SSO C2.2 con los 3 segmentos oficiales (/23 en 2x/24 + /24 services + /20 pods)"
+  description  = "VPC local para SSO C2.2 con los 3 segmentos oficiales (/24 subred primaria + /23 PSA en 2x/24 + /20 GKE en 2x/21)"
 
   depends_on = [module.apis]
 }
@@ -42,7 +42,7 @@ module "local_subnet" {
   network                  = module.local_vpc[0].network_id
   ip_cidr_range            = var.local_vpc.subnet_cidr
   private_ip_google_access = true
-  description              = "1ra mitad del segmento /23 (${var.local_vpc.subnet_cidr}): Nodos GKE y Cloud Run Direct VPC Egress"
+  description              = "Segmento /24 (${var.local_vpc.subnet_cidr}): Nodos GKE, ILBs y Cloud Run Direct VPC Egress"
 
   secondary_ip_ranges = [
     {
@@ -66,16 +66,34 @@ resource "google_compute_global_address" "local_psa" {
   address       = var.local_vpc.psa_address
   prefix_length = var.local_vpc.psa_prefix_length
   network       = module.local_vpc[0].network_id
-  description   = "2da mitad del segmento /23 (${var.local_vpc.psa_address}/${var.local_vpc.psa_prefix_length}): Private Services Access (Cloud SQL / AlloyDB y Memorystore Redis)"
+  description   = "2da mitad del segmento /23 (${var.local_vpc.psa_address}/${var.local_vpc.psa_prefix_length}): Private Services Access (Memorystore Redis)"
+}
+
+resource "google_compute_global_address" "local_psa_sql" {
+  count = var.enable_local_vpc ? 1 : 0
+
+  project       = var.project_id
+  name          = var.local_vpc.psa_sql_range_name
+  purpose       = "VPC_PEERING"
+  address_type  = "INTERNAL"
+  address       = var.local_vpc.psa_sql_address
+  prefix_length = var.local_vpc.psa_sql_prefix_length
+  network       = module.local_vpc[0].network_id
+  description   = "1ra mitad del segmento /23 (${var.local_vpc.psa_sql_address}/${var.local_vpc.psa_sql_prefix_length}): Private Services Access (Cloud SQL / AlloyDB for PostgreSQL 16)"
+
+  depends_on = [module.local_subnet]
 }
 
 resource "google_service_networking_connection" "local_psa" {
   count = var.enable_local_vpc ? 1 : 0
 
-  network                 = module.local_vpc[0].network_id
-  service                 = "servicenetworking.googleapis.com"
-  reserved_peering_ranges = [google_compute_global_address.local_psa[0].name]
-  deletion_policy         = "ABANDON"
+  network = module.local_vpc[0].network_id
+  service = "servicenetworking.googleapis.com"
+  reserved_peering_ranges = [
+    google_compute_global_address.local_psa[0].name,
+    google_compute_global_address.local_psa_sql[0].name,
+  ]
+  deletion_policy = "ABANDON"
 }
 
 module "local_router" {

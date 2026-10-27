@@ -19,26 +19,31 @@ enable_host_iam = false
 
 # ─── VPC Local con los 3 Segmentos Oficiales (/20, /23, /24) ─────────────────
 # Distribución exacta de los 3 segmentos oficiales:
-#   1. Segmento /23 (10.10.0.0/23 = 512 IPs) subdividido en sus dos mitades /24:
-#      - 1ra mitad /24 (10.10.0.0/24): Subred primaria snet-sso-ue1 (GKE Nodos + Cloud Run Direct VPC Egress)
-#      - 2da mitad /24 (10.10.1.0/24): Rango PSA psa-sso-des (Cloud SQL / AlloyDB + Memorystore Redis)
-#   2. Segmento /24 (10.10.2.0/24 = 256 IPs): Rango secundario GKE Services (services)
-#   3. Segmento /20 (10.10.16.0/20 = 4,096 IPs): Rango secundario GKE Pods (pods)
+#   1. Segmento /23 (10.10.0.0/23 = 512 IPs) dedicado a Private Services Access (servicenetworking.googleapis.com) en sus dos mitades /24:
+#      - 1ra mitad /24 (10.10.0.0/24, psa-sso-sql-des): Cloud SQL / AlloyDB for PostgreSQL 16 (requiere un bloque /24 exclusivo en GCP)
+#      - 2da mitad /24 (10.10.1.0/24, psa-sso-des): Memorystore for Redis (PRIVATE_SERVICE_ACCESS compatible con Shared VPC)
+#   2. Segmento /24 (10.10.2.0/24 = 256 IPs): Rango primario de subred snet-sso-ue1 (GKE Nodos + ILBs + Cloud Run Direct VPC Egress)
+#   3. Segmento /20 (10.10.16.0/20 = 4,096 IPs) dedicado a rangos secundarios GKE en sus dos mitades /21:
+#      - 1ra mitad /21 (10.10.16.0/21 = 2,048 IPs): GKE Pods (pods)
+#      - 2da mitad /21 (10.10.24.0/21 = 2,048 IPs): GKE Services (services)
 enable_local_vpc = true
 local_vpc = {
-  network_name        = "vpc-mec-sha-des"
-  routing_mode        = "REGIONAL"
-  subnet_name         = "snet-sso-ue1"
-  subnet_cidr         = "10.10.0.0/24"
-  pods_range_name     = "pods"
-  pods_cidr           = "10.10.16.0/20"
-  services_range_name = "services"
-  services_cidr       = "10.10.2.0/24"
-  psa_range_name      = "psa-sso-des"
-  psa_address         = "10.10.1.0"
-  psa_prefix_length   = 24
-  router_name         = "rtr-sso-des-ue1"
-  nat_name            = "nat-sso-des-ue1"
+  network_name          = "vpc-mec-sha-des"
+  routing_mode          = "REGIONAL"
+  subnet_name           = "snet-sso-ue1"
+  subnet_cidr           = "10.10.2.0/24"
+  pods_range_name       = "pods"
+  pods_cidr             = "10.10.16.0/21"
+  services_range_name   = "services"
+  services_cidr         = "10.10.24.0/21"
+  psa_range_name        = "psa-sso-des"
+  psa_address           = "10.10.1.0"
+  psa_prefix_length     = 24
+  psa_sql_range_name    = "psa-sso-sql-des"
+  psa_sql_address       = "10.10.0.0"
+  psa_sql_prefix_length = 24
+  router_name           = "rtr-sso-des-ue1"
+  nat_name              = "nat-sso-des-ue1"
 }
 
 # ─── Cuentas de Servicio de Mínimo Privilegio (SSO C2.2) ─────────────────────

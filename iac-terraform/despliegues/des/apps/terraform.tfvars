@@ -18,7 +18,7 @@ host_project_id   = "mec-003-sso-des"
 host_network_name = "vpc-mec-sha-des"
 enable_host_iam   = false
 
-# Subred primaria única snet-sso-ue1 (10.10.0.0/24, 1ra mitad del segmento /23)
+# Subred primaria única snet-sso-ue1 (10.10.2.0/24, segmento oficial /24)
 # compartida por los nodos GKE y Cloud Run Direct VPC Egress.
 host_subnet_names = {
   gke  = "snet-sso-ue1"
