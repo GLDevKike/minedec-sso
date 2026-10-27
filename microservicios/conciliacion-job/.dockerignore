@@ -1,9 +1,0 @@
-node_modules
-dist
-coverage
-tests
-*.md
-.git
-.gitignore
-.gitlab-ci.yml
-.env*

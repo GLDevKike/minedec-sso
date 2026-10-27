@@ -1,8 +1,0 @@
-node_modules
-dist
-coverage
-tests
-.git
-.gitignore
-*.md
-.env*
