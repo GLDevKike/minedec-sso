@@ -1,0 +1,64 @@
+# ==============================================================================
+# GitLab CI/CD Pipeline — @minedec/sincronizador (c2-sso/microservicios/sincronizador)
+# Runner institucional: gitlab-runner@gitlab-servinformacion.iam.gserviceaccount.com
+# Cumple Constitución MINEDEC v2.11.0 (Principios IV, XIV y XVIII)
+# ==============================================================================
+
+stages:
+  - quality
+  - test
+  - build
+  - publish
+
+variables:
+  GCP_REGION: "us-east1"
+  GAR_REPOSITORY: "sso-containers"
+  SERVICE_NAME: "sincronizador"
+
+default:
+  image: node:22-alpine
+
+gitleaks_scan:
+  stage: quality
+  image:
+    name: zricethezav/gitleaks:latest
+    entrypoint: [""]
+  script:
+    - gitleaks detect --source . --no-git --verbose
+
+lint_and_audit:
+  stage: quality
+  script:
+    - npm install --ignore-scripts
+    - npm run lint
+    - npm audit --omit=dev --audit-level=high
+
+unit_and_integration_tests:
+  stage: test
+  script:
+    - npm install --ignore-scripts
+    - npm run build
+    - npm run test:coverage
+  coverage: '/All files[^|]*\|[^|]*\s+([\d\.]+)/'
+
+publish_container_and_npm:
+  stage: publish
+  image: google/cloud-sdk:alpine
+  rules:
+    - if: '$CI_COMMIT_BRANCH =~ /^(main|qa|develop|release\/.*)$/'
+    - if: '$CI_COMMIT_BRANCH =~ /^spec\//'
+      when: manual
+      allow_failure: true
+  script:
+    - |
+      if [ "$CI_COMMIT_BRANCH" = "main" ]; then
+        GCP_PROJECT_ID="mec-003-sso-pro"
+      elif [ "$CI_COMMIT_BRANCH" = "qa" ] || [[ "$CI_COMMIT_BRANCH" =~ ^release/.* ]]; then
+        GCP_PROJECT_ID="mec-003-sso-pre"
+      else
+        GCP_PROJECT_ID="mec-003-sso-des"
+      fi
+    - IMAGE_URI="${GCP_REGION}-docker.pkg.dev/${GCP_PROJECT_ID}/${GAR_REPOSITORY}/${SERVICE_NAME}:${CI_COMMIT_SHA}"
+    - gcloud auth configure-docker "${GCP_REGION}-docker.pkg.dev" --quiet
+    - docker build --build-arg CI_JOB_TOKEN="${CI_JOB_TOKEN}" --build-arg SHARED_PACKAGE_PROJECT_ID="${SHARED_PACKAGE_PROJECT_ID}" -t "${IMAGE_URI}" .
+    - docker push "${IMAGE_URI}"

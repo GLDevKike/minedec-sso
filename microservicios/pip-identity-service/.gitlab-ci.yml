@@ -1,0 +1,74 @@
+# ==============================================================================
+# GitLab CI/CD Pipeline — @minedec/pip-identity-service
+# Ejecutado en GitLab Runner institucional:
+#   gitlab-runner@gitlab-servinformacion.iam.gserviceaccount.com (sin llaves JSON)
+# Consume @minedec/shared desde GitLab NPM Package Registry y publica imagen en
+# Artifact Registry (sso-containers) con tag inmutable $CI_COMMIT_SHA
+# ==============================================================================
+
+stages:
+  - quality
+  - test
+  - package
+
+default:
+  image: node:22-alpine
+
+variables:
+  NPM_CONFIG_CACHE: "$CI_PROJECT_DIR/.npm"
+  GCP_REGION: "us-east1"
+  GAR_REPOSITORY: "sso-containers"
+  SERVICE_NAME: "pip-identity-service"
+
+cache:
+  key: "$CI_COMMIT_REF_SLUG"
+  paths:
+    - .npm/
+
+lint_and_sast:
+  stage: quality
+  script:
+    - npm ci
+    - npm run lint
+    - npm audit --audit-level=high
+    - npm run build
+  artifacts:
+    paths:
+      - dist/
+    expire_in: 1 hour
+
+unit_and_integration_tests:
+  stage: test
+  needs: ["lint_and_sast"]
+  script:
+    - npm ci
+    - npm run test:coverage
+  coverage: '/All files[^|]*\|[^|]*\s+([\d\.]+)/'
+  artifacts:
+    when: always
+    paths:
+      - coverage/
+    expire_in: 7 days
+
+publish_container_image:
+  stage: package
+  image: google/cloud-sdk:alpine
+  needs: ["lint_and_sast", "unit_and_integration_tests"]
+  rules:
+    - if: '$CI_COMMIT_BRANCH =~ /^(main|qa|develop|release\/.*)$/'
+    - if: '$CI_COMMIT_BRANCH =~ /^spec\//'
+      when: manual
+      allow_failure: true
+  script:
+    - |
+      if [ "$CI_COMMIT_BRANCH" = "main" ]; then
+        GCP_PROJECT_ID="mec-003-sso-pro"
+      elif [ "$CI_COMMIT_BRANCH" = "qa" ] || [[ "$CI_COMMIT_BRANCH" =~ ^release/.* ]]; then
+        GCP_PROJECT_ID="mec-003-sso-pre"
+      else
+        GCP_PROJECT_ID="mec-003-sso-des"
+      fi
+    - gcloud auth configure-docker "${GCP_REGION}-docker.pkg.dev" --quiet
+    - IMAGE_URI="${GCP_REGION}-docker.pkg.dev/${GCP_PROJECT_ID}/${GAR_REPOSITORY}/${SERVICE_NAME}:${CI_COMMIT_SHA}"
+    - docker build --build-arg CI_JOB_TOKEN="${CI_JOB_TOKEN}" -t "${IMAGE_URI}" .
+    - docker push "${IMAGE_URI}"

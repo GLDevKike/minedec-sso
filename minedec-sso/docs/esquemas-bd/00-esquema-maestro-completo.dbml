@@ -1,0 +1,885 @@
+// =============================================================================
+// CONECTA MINEDEC (SUBCOMPONENTE C2.2) — ESQUEMA MAESTRO COMPLETO (dbdiagram.io)
+// Sincronizado 1:1 con migrations/001..004 y Especificacion Feature 004 (motor-pdp)
+// Normalizacion: 1FN / 3FN / BCNF Estricta + Proyeccion L2 Redis + Auditoria 3 Capas
+// Motores: AlloyDB for PostgreSQL 16 HA | Memorystore for Redis 7.x | BigQuery | GCS WORM
+// =============================================================================
+
+Project conecta_minedec_sso_c22_maestro {
+  database_type: 'PostgreSQL'
+  Note: '''
+    # Conecta MINEDEC (Subcomponente C2.2) — Esquema Maestro Completo
+    Arquitectura de Datos Normalizada (1FN / 3FN + Aislamiento Multi-Aplicacion por FK Compuesta) sincronizada 1:1 con `migrations/001` a `005` y dividida en 3 Etapas evolutivas:
+    - **Etapa 1 (Azul #1565c0 + Gris #37474f)**: PIP (Raiz Civil de Persona Natural en `persona_identidad`, Cuenta Google Workspace y Perfil RBAC/ABAC en `cuenta_institucional`, Contexto Territorial/Multisede en `asignacion_contexto`, Catalogos, Territorio, Anomalias, Sincronizacion y Conciliacion) + Cache L2 PIP + Auditoria Inmutable en 3 Capas.
+    - **Etapa 2 (Verde #2e7d32 + Naranja #ef6c00)**: PAP y Motor Hibrido RBAC + ABAC (`motor-pdp`) con aislamiento multi-aplicacion por FK compuesta, `modo_evaluacion_permisos` (`ANY` | `ALL`), capacidades CRUD (`puede_crear`, `puede_leer`, `puede_editar`, `puede_eliminar`), `perfil` conectado a `grupo_logico_perfil` y `usuario_rol_aplicacion`, modo sombra (`modo_sombra` en `aplicacion` y override en `ruta_catalogo`) y Cache L2 PDP.
+    - **Etapa 3 (Purpura #6a1b9a + Naranja #ef6c00)**: Clientes OIDC (`DA-11`), Credenciales M2M (`POST /api/v1/oauth/token` con `scopes_permitidos = 'pdp:evaluate'`), Rotacion JWKS RS256 (`<= 90 dias`), Publicador de Infraestructura Terraform y Sesiones/Codigos Efimeros OIDC en Redis.
+    - **Reglas Constitucionales**: Exclusivo para Personas Naturales (cero modelado de RUC) y Cero campos de latencia en tablas o proyecciones de aplicacion (Principio V.4 y XIII).
+  '''
+}
+
+// =============================================================================
+// ETAPA 1 — GRUPO 1: PIP — IDENTIDAD UNIFICADA, CATALOGOS, TERRITORIO Y CONCILIACION (3FN)
+// Sincronizado 1:1 con migrations/001, 002, 003 y 004
+// Color: Azul Institucional (#1565c0)
+// =============================================================================
+
+Table dominio_institucional [headercolor: #1565c0] {
+  dominio varchar(120) [pk, not null, note: 'PK natural en minusculas (ej. educacion.gob.ec, estudiantes.educacion.gob.ec, docentes.educacion.gob.ec, deporte.gob.ec, cultura.gob.ec, estudiante.edu.ec)']
+  google_customer_id varchar(64) [not null, note: 'ID inmutable del unico tenant de Google Workspace del Ministerio (D-21)']
+  tipo_poblacion varchar(40) [not null, note: 'CHECK: ESTUDIANTE | DOCENTE | ADMINISTRATIVO | MIXTO']
+  es_subdominio boolean [not null, default: false]
+  activo boolean [not null, default: true]
+  creado_en timestamptz [not null, default: `now()`]
+  actualizado_en timestamptz [not null, default: `now()`]
+
+  indexes {
+    (google_customer_id, activo) [name: 'idx_dominio_customer_activo']
+  }
+
+  Note: '[ETAPA 1 — migrations/001 & 004] Subdominios institucionales del unico tenant de Google Workspace sincronizados en modo SOLO LECTURA (RF-GI-01 / D-01 / D-21).'
+}
+
+Table catalogo_atributo_minedec [headercolor: #1565c0] {
+  catalogo_id uuid [pk, not null, default: `gen_random_uuid()`]
+  categoria_atributo varchar(40) [not null, note: 'CHECK: TIPO_IDENTIFICACION | TIPO_USUARIO | SUBTIPO_USUARIO | CARGO_FUNCION | GRADO_CURSO | NIVEL_ACADEMICO | VICEMINISTERIO | NIVEL_ESTRUCTURA | REGIMEN_ESCOLAR | MODALIDAD_EDUCATIVA | JORNADA']
+  codigo_valor varchar(64) [not null, note: 'Codigo canonico en mayusculas (ej. DOCENTE_CONTRATO, 8EGB, EDUCACION_SUPERIOR)']
+  codigo_padre varchar(64) [null, note: 'Relacion jerarquica logica: codigo_valor padre (ej. DOCENTE para SUBTIPO_USUARIO)']
+  etiqueta_visible varchar(160) [not null]
+  nivel_academico_derivado varchar(32) [null, note: 'Exclusivo para GRADO_CURSO: codigo de NIVEL_ACADEMICO que se deriva deterministicamente']
+  requiere_vigencia_temporal boolean [not null, default: false, note: 'true cuando el subtipo exige fecha_inicio_vigencia y fecha_fin_vigencia']
+  metadatos_regla jsonb [not null, default: '{}', note: 'Reglas adicionales y diccionario sinonimosOrigen para homologar fuentes FO-DNTIC-20']
+  activo boolean [not null, default: true]
+  creado_en timestamptz [not null, default: `now()`]
+  actualizado_en timestamptz [not null, default: `now()`]
+
+  indexes {
+    (categoria_atributo, codigo_valor) [unique, name: 'uq_catalogo_categoria_codigo']
+    (categoria_atributo, activo) [name: 'idx_catalogo_categoria_activo']
+  }
+
+  Note: '[ETAPA 1 — migrations/001 & 002] Catalogo parametrizable jerarquico en caliente (3FN). La unicidad es compuesta (categoria_atributo, codigo_valor).'
+}
+
+Table catalogo_territorio_sede [headercolor: #1565c0] {
+  codigo_amie varchar(8) [pk, not null, note: 'Regex estricta ^(0[1-9]|1[0-9]|2[0-4]|90)[A-Z][0-9]{5}$ (preserva cero inicial 01-09)']
+  nombre_institucion varchar(200) [not null]
+  codigo_zona varchar(4) [not null, note: 'Codigo de zona 01..09 o 90 con preservacion de cero inicial']
+  codigo_distrito varchar(8) [null, note: 'Anulable para sedes especiales FO-DNTIC-20 sin distrito asignado']
+  codigo_circuito varchar(12) [null, note: 'Anulable para sedes especiales FO-DNTIC-20 sin circuito asignado']
+  provincia_dpa varchar(2) [null, note: 'Codigo DPA INEC provincia (01..24, 90)']
+  canton_dpa varchar(4) [null, note: 'Codigo DPA INEC canton']
+  parroquia_dpa varchar(6) [null, note: 'Codigo DPA INEC parroquia']
+  regimen_escolar varchar(24) [not null, default: 'SIERRA_AMAZONIA', note: 'CHECK: COSTA_GALAPAGOS | SIERRA_AMAZONIA | NO_APLICA']
+  sostenimiento varchar(30) [null, note: 'CHECK: FISCAL | FISCOMISIONAL | MUNICIPAL | PARTICULAR']
+  modalidad_educativa varchar(30) [null, default: 'PRESENCIAL', note: 'CHECK: PRESENCIAL | SEMIPRESENCIAL | A_DISTANCIA | VIRTUAL | NO_APLICA']
+  jornada varchar(24) [null, default: 'MATUTINA', note: 'CHECK: MATUTINA | VESPERTINA | NOCTURNA | INTENSIVA | NO_APLICA']
+  activo boolean [not null, default: true]
+  creado_en timestamptz [not null, default: `now()`]
+  actualizado_en timestamptz [not null, default: `now()`]
+
+  indexes {
+    (codigo_zona, codigo_distrito, codigo_circuito) [name: 'idx_territorio_jerarquia']
+  }
+
+  Note: '[ETAPA 1 — migrations/001] Maestro normalizado 3FN de sedes educativas (AMIE) y jerarquia territorial DPA/Distrital/Escolar.'
+}
+
+Table persona_identidad [headercolor: #1565c0] {
+  id_interno uuid [pk, not null, default: `gen_random_uuid()`, note: 'PK tecnica inmutable UUID v4 (protege FKs y auditoria_evento ante transicion CODIGO_MINEDEC -> CEDULA)']
+  tipo_identificacion varchar(20) [not null, note: 'CHECK: CEDULA | PASAPORTE | CODIGO_MINEDEC (Exclusivo personas naturales). Si estado_persona = PENDIENTE_IDENTIFICACION se asigna CODIGO_MINEDEC.']
+  numero_identificacion varchar(64) [unique, not null, note: 'VARCHAR(64) con preservacion de cero inicial (01..09). En PENDIENTE_IDENTIFICACION almacena PROVISIONAL-{google_sub_id}. Inmutable por trigger cuando tipo_identificacion = CEDULA.']
+  codigo_minedec_anterior varchar(64) [unique, null, note: 'Almacena el CODIGO_MINEDEC previo tras la unica transicion unidireccional permitida a CEDULA']
+  nombre_completo varchar(250) [not null]
+  fecha_nacimiento date [null]
+  representante_legal_cedula varchar(10) [null, note: 'Cedula valida Modulo 10 del representante legal cuando el estudiante es menor de edad (< 18 anos)']
+  estado_persona varchar(32) [not null, default: 'ACTIVA', note: 'CHECK: ACTIVA | PENDIENTE_IDENTIFICACION | PENDIENTE_CONCILIACION | RESTRINGIDA_ANOMALIA | BLOQUEADA_ANOMALIA | INACTIVA']
+  creado_en timestamptz [not null, default: `now()`]
+  actualizado_en timestamptz [not null, default: `now()`]
+
+  indexes {
+    (tipo_identificacion, numero_identificacion) [unique, name: 'uq_persona_tipo_numero_id']
+    (numero_identificacion) [unique, name: 'uq_persona_numero_identificacion', note: 'Unicidad global intencional en migrations/001 para deteccion univoca de COLISION_IDENTIFICADOR']
+    (estado_persona) [name: 'idx_persona_estado']
+    (codigo_minedec_anterior) [name: 'idx_persona_codigo_anterior']
+  }
+
+  Note: '[ETAPA 1 — migrations/001 & 003] Nivel 1 (3FN Puro): Raiz civil y demografica de Persona Natural. Los atributos poblacionales/ABAC viven en cuenta_institucional y asignacion_contexto.'
+}
+
+Table cuenta_institucional [headercolor: #1565c0] {
+  cuenta_id uuid [pk, not null, default: `gen_random_uuid()`]
+  id_interno uuid [not null, note: 'FK a persona_identidad.id_interno (N cuentas de distintos subdominios pueden vincularse a 1 persona)']
+  google_sub_id varchar(64) [unique, not null, note: 'Identificador inmutable de Google Workspace (sub / id)']
+  email_principal varchar(254) [unique, not null, note: 'Correo institucional en minusculas con indice funcional uq_cuenta_email_lower']
+  dominio varchar(120) [not null, note: 'FK a dominio_institucional.dominio']
+  org_unit_path varchar(512) [not null, default: '/']
+  given_name varchar(120) [null]
+  family_name varchar(120) [null]
+  tipo_usuario varchar(40) [null, note: 'CHECK: ESTUDIANTE | DOCENTE | ADMINISTRATIVO | EXTERNO | DOCENTE_ADMINISTRATIVO | CIUDADANO_EXTERNO']
+  subtipo_usuario varchar(40) [null, note: 'Validado contra catalogo_atributo_minedec (categoria = SUBTIPO_USUARIO, codigo_padre = tipo_usuario)']
+  cargo_funcion varchar(64) [null, note: 'Validado contra catalogo_atributo_minedec (categoria = CARGO_FUNCION)']
+  grado_curso varchar(32) [null, note: 'Validado contra catalogo_atributo_minedec (categoria = GRADO_CURSO)']
+  nivel_academico_derivado varchar(32) [null, note: 'Derivado deterministicamente desde grado_curso']
+  docente_multisede boolean [not null, default: false]
+  fecha_inicio_vigencia date [null]
+  fecha_fin_vigencia date [null, note: 'CHECK: fecha_fin_vigencia >= fecha_inicio_vigencia. Vencimiento dispara fail-close VIGENCIA_VENCIDA']
+  suspended_en_gws boolean [not null, default: false]
+  estado_sincronizacion varchar(32) [not null, default: 'SINCRONIZADA', note: 'CHECK: SINCRONIZADA | REGISTRO_CALIENTE | SUSPENDIDA_GWS | ELIMINADA_GWS | VIGENCIA_VENCIDA | BLOQUEADA_ANOMALIA']
+  origen_ultima_sincronizacion varchar(40) [null, note: 'CHECK: EVENTO_AUDIT_LOG | BARRIDO_DELTA_2MIN | CONCILIACION_BATCH | CONCILIACION_DIARIA | REGISTRO_CALIENTE_PRIORITARIO']
+  hash_payload_gws char(64) [null, note: 'Hash SHA-256 canonico del payload de Google Workspace para evitar escrituras redundantes']
+  ultima_sincronizacion_en timestamptz [not null, default: `now()`]
+  creado_en timestamptz [not null, default: `now()`]
+  actualizado_en timestamptz [not null, default: `now()`]
+
+  indexes {
+    (id_interno) [name: 'idx_cuenta_id_interno']
+    (cuenta_id, id_interno) [unique, name: 'uq_cuenta_id_persona_compuesto', note: 'Agregado en migrations/005 para soportar FKs compuestas (cuenta_id, id_interno) desde asignacion_contexto y usuario_rol_aplicacion']
+    (dominio, estado_sincronizacion) [name: 'idx_cuenta_dominio_estado']
+    (tipo_usuario, subtipo_usuario, cargo_funcion) [name: 'idx_cuenta_rbac_tripleta']
+  }
+
+  Note: '[ETAPA 1 — migrations/001 & 003] Nivel 2 (3FN Puro): Cuenta institucional de Google Workspace y perfil poblacional RBAC/ABAC por subdominio (resuelve coexistencia Docente + Estudiante). `nivel_academico_derivado` se materializa al persistir `grado_curso` consultando `catalogo_atributo_minedec`.'
+}
+
+Table asignacion_contexto [headercolor: #1565c0] {
+  asignacion_id uuid [pk, not null, default: `gen_random_uuid()`]
+  id_interno uuid [not null, note: 'FK a persona_identidad.id_interno']
+  cuenta_id uuid [null, note: 'FK opcional a cuenta_institucional.cuenta_id (con FK compuesta (cuenta_id, id_interno) en migrations/005 para garantizar que pertenezcan a la misma persona)']
+  origen_datos varchar(24) [not null, default: 'PAP_DELEGADO', note: 'CHECK: GWS_PRIMARIO | PAP_DELEGADO']
+  es_sede_primaria boolean [not null, default: false]
+  nivel_estructura varchar(40) [not null, default: 'INSTITUCION_EDUCATIVA', note: 'CHECK: PLANTA_CENTRAL | ZONA | DISTRITO | CIRCUITO | INSTITUCION_EDUCATIVA']
+  viceministerio varchar(40) [not null, default: 'NO_APLICA', note: 'CHECK: EDUCACION | DEPORTE | CULTURA | GESTION_EDUCATIVA | NO_APLICA']
+  codigo_zona varchar(4) [not null, note: 'Preserva cero inicial (01..09, 10..24, 90)']
+  codigo_distrito varchar(8) [null]
+  codigo_circuito varchar(12) [null]
+  codigo_amie varchar(8) [null, note: 'FK a catalogo_territorio_sede.codigo_amie (cuando NOT NULL, trigger valida coherencia de zona/distrito/circuito contra catalogo_territorio_sede)']
+  codigo_dependencia_admin varchar(160) [null]
+  regimen_escolar varchar(24) [not null, default: 'NO_APLICA', note: 'CHECK: COSTA_GALAPAGOS | SIERRA_AMAZONIA | NO_APLICA']
+  modalidad_educativa varchar(30) [not null, default: 'NO_APLICA', note: 'CHECK: PRESENCIAL | SEMIPRESENCIAL | A_DISTANCIA | VIRTUAL | NO_APLICA']
+  jornada varchar(24) [not null, default: 'NO_APLICA', note: 'CHECK: MATUTINA | VESPERTINA | NOCTURNA | INTENSIVA | NO_APLICA']
+  activo boolean [not null, default: true]
+  asignado_por_identificacion varchar(64) [null, note: 'Identificador textual en Etapa 1 porque puede provenir de un proceso automatico (GWS_PRIMARIO / Service Account) sin UUID en persona_identidad']
+  motivo_asignacion text [null]
+  creado_en timestamptz [not null, default: `now()`]
+  actualizado_en timestamptz [not null, default: `now()`]
+
+  indexes {
+    (id_interno, activo) [name: 'idx_contexto_id_interno_activo']
+    (codigo_amie, activo) [name: 'idx_contexto_amie_activo']
+    (codigo_zona, codigo_distrito, codigo_circuito) [name: 'idx_contexto_zona_distrito_circuito']
+  }
+
+  Note: '[ETAPA 1 — migrations/001] Nivel 3 (3FN Puro): Asignacion de contexto territorial, organizacional y multisede (1:N). Produce amies_asignados[] en el PDP.'
+}
+
+Table anomalia_identidad [headercolor: #1565c0] {
+  anomalia_id uuid [pk, not null, default: `gen_random_uuid()`]
+  anomalia_anterior_id uuid [null, note: 'FK auto-referenciada a anomalia_identidad.anomalia_id para encadenar recurrencias']
+  id_interno uuid [null, note: 'FK opcional a persona_identidad.id_interno']
+  cuenta_id uuid [null, note: 'FK opcional a cuenta_institucional.cuenta_id']
+  google_sub_id varchar(64) [not null]
+  email_principal varchar(254) [not null]
+  dominio varchar(120) [not null]
+  codigo_causal varchar(40) [not null, note: 'CHECK: SIN_IDENTIFICACION_VALIDA | COLISION_IDENTIFICADOR | VIGENCIA_INVALIDA | ATRIBUTO_OBLIGATORIO_FALTANTE | FORMATO_AMIE_INVALIDO']
+  efecto_acceso varchar(20) [not null, note: 'CHECK: BLOQUEANTE | RESTRINGIDA']
+  estado_anomalia varchar(24) [not null, default: 'ABIERTA', note: 'CHECK: ABIERTA | EN_REVISION | LISTA_PARA_CERRAR | RESUELTA | DESCARTADA']
+  origen_resolucion varchar(32) [null, note: 'CHECK: AUTO_SINCRONIZACION | MANUAL_ADMIN']
+  resuelta_por_identificacion varchar(64) [null]
+  motivo_resolucion text [null]
+  valor_anterior jsonb [null]
+  valor_nuevo jsonb [null]
+  detalle_tecnico text [not null]
+  detectada_en timestamptz [not null, default: `now()`]
+  resuelta_en timestamptz [null]
+
+  indexes {
+    (estado_anomalia, codigo_causal, dominio, detectada_en) [name: 'idx_anomalia_bandeja_estado']
+    (google_sub_id, codigo_causal, estado_anomalia) [name: 'idx_anomalia_google_sub_causal']
+    (id_interno) [name: 'idx_anomalia_id_interno']
+  }
+
+  Note: '[ETAPA 1 — migrations/001 & 003] Bandeja de anomalias de identidad con bloqueo graduado (BLOQUEANTE vs RESTRINGIDA) y trazabilidad de recurrencias.'
+}
+
+Table checkpoint_conciliacion [headercolor: #1565c0] {
+  checkpoint_id uuid [pk, not null, default: `gen_random_uuid()`]
+  dominio varchar(120) [not null, note: 'FK a dominio_institucional.dominio']
+  org_unit_path varchar(512) [not null, default: '/']
+  tipo_proceso varchar(32) [not null, note: 'CHECK: BARRIDO_DELTA_2MIN | CONCILIACION_DIARIA | CONCILIACION_MASIVA']
+  next_page_token text [null]
+  cuentas_procesadas integer [not null, default: 0]
+  cuentas_actualizadas integer [not null, default: 0]
+  cuentas_omitidas_hash integer [not null, default: 0]
+  cuentas_baja_detectadas integer [not null, default: 0]
+  anomalias_abiertas integer [not null, default: 0]
+  estado_ejecucion varchar(24) [not null, default: 'PENDIENTE', note: 'CHECK: PENDIENTE | EN_PROGRESO | COMPLETADA | PAUSADA_CUOTA | FALLIDA']
+  worker_instancia_id varchar(128) [null]
+  lock_advisory_key bigint [not null]
+  heartbeat_en timestamptz [not null, default: `now()`]
+  iniciado_en timestamptz [not null, default: `now()`]
+  completado_en timestamptz [null]
+  ultimo_error_codigo varchar(64) [null]
+  diagnostico_operativo text [null]
+  creado_en timestamptz [not null, default: `now()`]
+  actualizado_en timestamptz [not null, default: `now()`]
+
+  indexes {
+    (dominio, org_unit_path, tipo_proceso) [unique, name: 'uq_checkpoint_particion']
+    (estado_ejecucion, heartbeat_en) [name: 'idx_checkpoint_estado_heartbeat']
+    (dominio, tipo_proceso) [name: 'idx_checkpoint_dominio_proceso']
+  }
+
+  Note: '[ETAPA 1 — migrations/003] Estado de cursores de sincronizacion incremental y conciliacion nocturna particionada contra Google Admin SDK Directory API.'
+}
+
+Table evento_sincronizacion_procesado [headercolor: #1565c0] {
+  id_evento_externo varchar(128) [pk, not null]
+  google_sub_id varchar(64) [not null]
+  email_principal varchar(254) [null]
+  tipo_evento varchar(48) [not null, note: 'CHECK: CREATE_USER | CHANGE_USER_CUSTOM_FIELDS | SUSPEND_USER | UNSUSPEND_USER | DELETE_USER | UNDELETE_USER | CHANGE_ORG_UNIT | HOT_REGISTRATION_RECONCILE | DELTA_SWEEP_UPDATE']
+  timestamp_evento_gws timestamptz [not null]
+  origen_canal varchar(32) [not null, note: 'CHECK: PUBSUB_AUDIT_LOG | CLOUD_SCHEDULER_DELTA | CLOUD_TASKS_PRIORITY | DLQ_REPLAY']
+  modo_despacho varchar(24) [not null, note: 'CHECK: DIRECT_EXTRACT | FETCH_BY_SUB']
+  resultado varchar(32) [not null, note: 'CHECK: PROCESADO | OMITIDO_HASH_IDENTICO | DESCARTADO_OBSOLETO | IGNORADO_IDEMPOTENTE']
+  hash_payload_gws char(64) [null]
+  procesado_en timestamptz [not null, default: `now()`]
+
+  indexes {
+    (google_sub_id, timestamp_evento_gws) [name: 'idx_evento_sync_sub_timestamp']
+    (procesado_en) [name: 'idx_evento_sync_procesado_en']
+  }
+
+  Note: '[ETAPA 1 — migrations/003] Registro de idempotencia y orden monotonico de eventos de sincronizacion (cero campos de latencia conforme a Constitucion V.4).'
+}
+
+Table registro_fallo_sincronizacion [headercolor: #1565c0] {
+  dlq_id uuid [pk, not null, default: `gen_random_uuid()`]
+  id_evento_externo varchar(128) [unique, not null]
+  origen_canal varchar(32) [not null, note: 'CHECK: PUBSUB_AUDIT_LOG | CLOUD_TASKS_PRIORITY | BARRIDO_DELTA_2MIN | CONCILIACION_MASIVA']
+  google_sub_id varchar(64) [null]
+  email_principal varchar(254) [null]
+  dominio varchar(120) [null]
+  tipo_evento varchar(48) [not null]
+  payload_original jsonb [not null]
+  intentos_realizados integer [not null, default: 5]
+  codigo_error varchar(64) [not null]
+  detalle_error_tecnico text [not null]
+  diagnostico_lenguaje_natural text [not null]
+  accion_recomendada text [not null]
+  estado_dlq varchar(32) [not null, default: 'PENDIENTE_REVISION', note: 'CHECK: PENDIENTE_REVISION | EN_REPROCESO | EN_REPROCESAMIENTO | RESUELTO_REPROCESADO | RESUELTO_POR_OBSOLESCENCIA | DESCARTADO_MANUAL (sincronizado con migrations/003; EN_REPROCESO y EN_REPROCESAMIENTO coexistentes por compatibilidad legacy)']
+  resuelto_por_identificacion varchar(64) [null]
+  motivo_resolucion text [null]
+  creado_en timestamptz [not null, default: `now()`]
+  actualizado_en timestamptz [not null, default: `now()`]
+  resuelto_en timestamptz [null]
+
+  indexes {
+    (estado_dlq, creado_en) [name: 'idx_dlq_estado_creado']
+    (google_sub_id) [name: 'idx_dlq_google_sub']
+  }
+
+  Note: '[ETAPA 1 — migrations/003] Bandeja persistente de eventos fallidos (DLQ) con proteccion de obsolescencia.'
+}
+
+// =============================================================================
+// ETAPA 2 — GRUPO 2: PAP — GOBIERNO DE APLICACIONES Y MOTOR HIBRIDO RBAC + ABAC
+// Sincronizado con migrations/004 y migrations/005 (Feature 004: motor-pdp)
+// Color: Verde Autorizacion (#2e7d32)
+// =============================================================================
+
+Table aplicacion [headercolor: #2e7d32] {
+  aplicacion_id uuid [pk, not null, default: `gen_random_uuid()`]
+  codigo_unico varchar(64) [unique, not null, note: 'Slug institucional inmutable (ej. sso-academico)']
+  nombre_visible varchar(160) [not null]
+  descripcion text [null]
+  patron_integracion varchar(32) [not null, note: 'CHECK: PATRON_1_SP_RP | PATRON_2_PEP_PERIMETRAL']
+  nivel_adopcion_pep varchar(24) [null, note: 'CHECK: PROTEGIDA | INTEGRADA | NATIVA (NULL cuando patron_integracion = PATRON_1_SP_RP)']
+  host_publico varchar(255) [unique, not null, note: 'FQDN expuesto en Cloud Load Balancing / Apigee X']
+  url_backend_interno varchar(512) [null, note: 'URL interna en VPC cuando patron_integracion = PATRON_2_PEP_PERIMETRAL']
+  politica_ruta_defecto varchar(24) [not null, default: 'PROTEGIDA', note: 'CHECK: PUBLICA | AUTENTICADA | PROTEGIDA (Fail-close por defecto RF-AU-09)']
+  modo_sombra boolean [not null, default: false, note: 'Agregado en migrations/005 (Feature 004): true evalua y audita rechazos como PDP_EVALUACION_SHADOW_PERMIT sin bloquear trafico']
+  viceministerio_dueno varchar(40) [not null, default: 'EDUCACION', note: 'CHECK: EDUCACION | DEPORTE | CULTURA | GESTION_EDUCATIVA | TRANSVERSAL']
+  estado_ciclo_vida varchar(24) [not null, default: 'BORRADOR', note: 'CHECK: BORRADOR | PUBLICANDO | PUBLICADO | SUSPENDIDO | DESPUBLICADO']
+  version_catalogo integer [not null, default: 1, note: 'Incrementa en cada publicacion e invalida cache L2 del PDP']
+  creado_por uuid [not null, note: 'FK a persona_identidad.id_interno']
+  creado_en timestamptz [not null, default: `now()`]
+  actualizado_en timestamptz [not null, default: `now()`]
+
+  indexes {
+    (estado_ciclo_vida) [name: 'idx_aplicacion_estado_ciclo_vida']
+  }
+
+  Note: '[ETAPA 2 — migrations/004 + migrations/005] Registro de activos tecnologicos protegidos por Conecta MINEDEC (RF-GA-01). La columna `modo_sombra` se agrega en `migrations/005_motor_pdp_authorization_schema.sql`.'
+}
+
+Table administrador_aplicativo [headercolor: #2e7d32] {
+  admin_app_id uuid [pk, not null, default: `gen_random_uuid()`]
+  aplicacion_id uuid [null, note: 'FK a aplicacion.aplicacion_id (NULL exclusivo cuando rol_consola IN (SUPERADMIN_SEGURIDAD, AUDITOR_GLOBAL))']
+  id_interno uuid [not null, note: 'FK a persona_identidad.id_interno']
+  rol_consola varchar(32) [not null, default: 'ADMIN_PROPIETARIO', note: 'CHECK: SUPERADMIN_SEGURIDAD | AUDITOR_GLOBAL | ADMIN_PROPIETARIO | OPERADOR_POLITICAS | AUDITOR_APP']
+  activo boolean [not null, default: true]
+  asignado_por uuid [not null, note: 'FK a persona_identidad.id_interno']
+  creado_en timestamptz [not null, default: `now()`]
+  actualizado_en timestamptz [not null, default: `now()`]
+
+  indexes {
+    (id_interno, rol_consola, aplicacion_id) [unique, name: 'uq_admin_consola_persona_ambito', note: 'UNIQUE NULLS NOT DISTINCT WHERE activo = true']
+    (aplicacion_id, activo) [name: 'idx_admin_app_activo']
+  }
+
+  Note: '[ETAPA 2 — migrations/005] Gobierno centralizado y delegado de la Consola PAP (3 roles de consola: Superadministrador de Seguridad Informatica, Administrador de Aplicativo y Auditor).'
+}
+
+Table ruta_catalogo [headercolor: #2e7d32] {
+  ruta_id uuid [pk, not null, default: `gen_random_uuid()`]
+  aplicacion_id uuid [not null]
+  patron_ruta varchar(512) [not null, note: 'Ruta normalizada sin .. ni %2F (ej. /api/v1/calificaciones/*)']
+  metodo_http varchar(10) [not null, default: 'ALL', note: 'CHECK: GET | POST | PUT | PATCH | DELETE | OPTIONS | HEAD | ALL (1FN Estricta)']
+  tipo_coincidencia varchar(16) [not null, note: 'CHECK: EXACTA | PREFIJO | EXTENSION']
+  nivel_acceso varchar(16) [not null, note: 'CHECK: PUBLICA | AUTENTICADA | PROTEGIDA']
+  modo_evaluacion_permisos varchar(8) [not null, default: 'ANY', note: 'CHECK: ANY (OR logico) | ALL (AND logico) cuando ruta_permiso_requerido tiene >1 permiso']
+  orden_especificidad integer [not null, default: 100, note: 'Precedencia deterministica: Exacta > Prefijo mas largo > Extension > Defecto']
+  modo_sombra boolean [not null, default: false, note: 'Override opcional por ruta: cuando true o aplicacion.modo_sombra = true, audita SHADOW_PERMIT sin bloquear']
+  descripcion varchar(255) [null]
+  activo boolean [not null, default: true]
+  creado_en timestamptz [not null, default: `now()`]
+  actualizado_en timestamptz [not null, default: `now()`]
+
+  indexes {
+    (aplicacion_id, ruta_id) [unique, name: 'uq_ruta_app_id_compuesto']
+    (aplicacion_id, patron_ruta, metodo_http, tipo_coincidencia) [unique, name: 'uq_ruta_app_patron_metodo']
+    (aplicacion_id, activo, orden_especificidad) [name: 'idx_ruta_evaluacion_pdp']
+  }
+
+  Note: '[ETAPA 2 — migrations/005] Catalogo declarativo de rutas (1FN/3FN) con modo_evaluacion_permisos explicito (ANY | ALL) y soporte de modo_sombra.'
+}
+
+Table permiso_atomico [headercolor: #2e7d32] {
+  permiso_id uuid [pk, not null, default: `gen_random_uuid()`]
+  aplicacion_id uuid [not null]
+  codigo_permiso varchar(100) [not null, note: 'Recurso/modulo o accion granular ej. CALIFICACIONES:ACTAS']
+  nombre_visible varchar(160) [not null]
+  descripcion text [null]
+  activo boolean [not null, default: true]
+  creado_en timestamptz [not null, default: `now()`]
+  actualizado_en timestamptz [not null, default: `now()`]
+
+  indexes {
+    (aplicacion_id, permiso_id) [unique, name: 'uq_permiso_app_id_compuesto']
+    (aplicacion_id, codigo_permiso) [unique, name: 'uq_permiso_app_codigo']
+  }
+
+  Note: '[ETAPA 2 — migrations/005] Unidad minima de autorizacion (RF-AU-02) con indice unico compuesto (aplicacion_id, permiso_id) para aislamiento entre aplicaciones.'
+}
+
+Table ruta_permiso_requerido [headercolor: #2e7d32] {
+  aplicacion_id uuid [not null, note: 'Aislamiento por FK compuesta: garantiza que la ruta y el permiso pertenezcan a la misma aplicacion']
+  ruta_id uuid [not null]
+  permiso_id uuid [not null]
+  accion_crud_requerida varchar(16) [not null, default: 'LEER', note: 'CHECK: CREAR | LEER | EDITAR | ELIMINAR | CUALQUIERA']
+  creado_en timestamptz [not null, default: `now()`]
+
+  indexes {
+    (ruta_id, permiso_id) [pk, name: 'pk_ruta_permiso_requerido']
+  }
+
+  Note: '[ETAPA 2 — migrations/005] Tabla asociativa con FK compuesta: vincula una ruta PROTEGIDA con los permisos atomicos requeridos y su capacidad CRUD exigida.'
+}
+
+Table rol [headercolor: #2e7d32] {
+  rol_id uuid [pk, not null, default: `gen_random_uuid()`]
+  aplicacion_id uuid [not null]
+  codigo_rol varchar(80) [not null, note: 'ej. DOCENTE_CALIFICADOR, ANALISTA_DISTRITAL']
+  nombre_visible varchar(160) [not null]
+  descripcion text [null]
+  es_rol_sistema boolean [not null, default: false]
+  activo boolean [not null, default: true]
+  creado_en timestamptz [not null, default: `now()`]
+  actualizado_en timestamptz [not null, default: `now()`]
+
+  indexes {
+    (aplicacion_id, rol_id) [unique, name: 'uq_rol_app_id_compuesto']
+    (aplicacion_id, codigo_rol) [unique, name: 'uq_rol_app_codigo']
+  }
+
+  Note: '[ETAPA 2 — migrations/005] Roles de negocio por aplicacion (RF-AU-01) con indice unico compuesto (aplicacion_id, rol_id) para integridad entre aplicaciones.'
+}
+
+Table rol_permiso [headercolor: #2e7d32] {
+  aplicacion_id uuid [not null, note: 'Aislamiento por FK compuesta: impide cruzar un rol de App A con un permiso de App B']
+  rol_id uuid [not null]
+  permiso_id uuid [not null]
+  puede_crear boolean [not null, default: false]
+  puede_leer boolean [not null, default: true]
+  puede_editar boolean [not null, default: false]
+  puede_eliminar boolean [not null, default: false]
+  creado_en timestamptz [not null, default: `now()`]
+  actualizado_en timestamptz [not null, default: `now()`]
+
+  indexes {
+    (rol_id, permiso_id) [pk, name: 'pk_rol_permiso']
+  }
+
+  Note: '[ETAPA 2 — migrations/005] Relacion M:N entre Rol y Permiso Atomico con banderas CRUD explicitas y `CHECK (puede_crear OR puede_leer OR puede_editar OR puede_eliminar)`. Si se desmarcan las 4 capacidades, la fila se elimina de rol_permiso.'
+}
+
+Table perfil [headercolor: #2e7d32] {
+  perfil_id uuid [pk, not null, default: `gen_random_uuid()`]
+  aplicacion_id uuid [not null]
+  codigo_perfil varchar(80) [not null]
+  nombre_visible varchar(160) [not null]
+  descripcion text [null]
+  activo boolean [not null, default: true]
+  creado_en timestamptz [not null, default: `now()`]
+  actualizado_en timestamptz [not null, default: `now()`]
+
+  indexes {
+    (aplicacion_id, perfil_id) [unique, name: 'uq_perfil_app_id_compuesto']
+    (aplicacion_id, codigo_perfil) [unique, name: 'uq_perfil_app_codigo']
+  }
+
+  Note: '[ETAPA 2 — migrations/005] Agrupacion reutilizable de roles dentro de una aplicacion (`RF-AUZ-04`). Un perfil se otorga dinamicamente via `grupo_logico_perfil` o nominalmente via `usuario_rol_aplicacion.perfil_id`.'
+}
+
+Table perfil_rol [headercolor: #2e7d32] {
+  aplicacion_id uuid [not null, note: 'Aislamiento por FK compuesta: impide cruzar un perfil de App A con un rol de App B']
+  perfil_id uuid [not null]
+  rol_id uuid [not null]
+  creado_en timestamptz [not null, default: `now()`]
+
+  indexes {
+    (perfil_id, rol_id) [pk, name: 'pk_perfil_rol']
+  }
+
+  Note: '[ETAPA 2 — migrations/005] Relacion M:N con FK compuesta entre Perfil y Rol de la misma aplicacion.'
+}
+
+Table grupo_logico [headercolor: #2e7d32] {
+  grupo_logico_id uuid [pk, not null, default: `gen_random_uuid()`]
+  aplicacion_id uuid [not null]
+  codigo_grupo varchar(80) [not null, note: 'ej. GL_DOCENTES_AULA_ACTIVOS']
+  nombre_visible varchar(160) [not null]
+  descripcion text [null]
+  regla_cruce_abac_rbac jsonb [not null, note: 'AST JSON tipado (Zod, prof. <= 3, <= 20 predicados) sobre atributos de persona_identidad + cuenta_institucional + asignacion_contexto']
+  prioridad_evaluacion integer [not null, default: 100]
+  activo boolean [not null, default: true]
+  creado_por uuid [not null, note: 'FK a persona_identidad.id_interno']
+  creado_en timestamptz [not null, default: `now()`]
+  actualizado_en timestamptz [not null, default: `now()`]
+
+  indexes {
+    (aplicacion_id, grupo_logico_id) [unique, name: 'uq_grupo_app_id_compuesto']
+    (aplicacion_id, codigo_grupo) [unique, name: 'uq_grupo_app_codigo']
+  }
+
+  Note: '[ETAPA 2 — migrations/005] Motor declarativo RBAC x ABAC (RF-AU-04). Cuando una persona satisface multiples grupos logicos activos, el PDP aplica union aditiva/acumulativa de sus roles directos (`grupo_logico_rol`) y perfiles (`grupo_logico_perfil` -> `perfil_rol`).'
+}
+
+Table grupo_logico_rol [headercolor: #2e7d32] {
+  aplicacion_id uuid [not null, note: 'Aislamiento por FK compuesta: garantiza que el grupo logico y el rol pertenezcan a la misma aplicacion']
+  grupo_logico_id uuid [not null]
+  rol_id uuid [not null]
+  creado_en timestamptz [not null, default: `now()`]
+
+  indexes {
+    (grupo_logico_id, rol_id) [pk, name: 'pk_grupo_logico_rol']
+  }
+
+  Note: '[ETAPA 2 — migrations/005] Roles otorgados automaticamente cuando el expediente de una persona satisface la regla RBAC x ABAC del grupo logico.'
+}
+
+Table grupo_logico_perfil [headercolor: #2e7d32] {
+  aplicacion_id uuid [not null, note: 'Aislamiento por FK compuesta: garantiza que el grupo logico y el perfil pertenezcan a la misma aplicacion']
+  grupo_logico_id uuid [not null]
+  perfil_id uuid [not null]
+  creado_en timestamptz [not null, default: `now()`]
+
+  indexes {
+    (grupo_logico_id, perfil_id) [pk, name: 'pk_grupo_logico_perfil']
+  }
+
+  Note: '[ETAPA 2 — migrations/005] Perfiles reutilizables (`RF-AUZ-04`) otorgados automaticamente cuando el expediente de una persona satisface la regla RBAC x ABAC del grupo logico (se expanden a sus roles activos mediante `perfil_rol`).'
+}
+
+Table usuario_rol_aplicacion [headercolor: #2e7d32] {
+  asignacion_rol_id uuid [pk, not null, default: `gen_random_uuid()`]
+  id_interno uuid [not null, note: 'FK a persona_identidad.id_interno']
+  cuenta_id uuid [null, note: 'FK opcional a cuenta_institucional.cuenta_id con FK compuesta (cuenta_id, id_interno) hacia cuenta_institucional(cuenta_id, id_interno)']
+  aplicacion_id uuid [not null]
+  rol_id uuid [null, note: 'FK compuesta (aplicacion_id, rol_id) a rol. Mutuamente excluyente con perfil_id: CHECK ((rol_id IS NOT NULL AND perfil_id IS NULL) OR (rol_id IS NULL AND perfil_id IS NOT NULL))']
+  perfil_id uuid [null, note: 'FK compuesta (aplicacion_id, perfil_id) a perfil (RF-AUZ-04). Mutuamente excluyente con rol_id']
+  codigo_zona_acotado varchar(4) [null, note: 'Scoping territorial opcional para esta asignacion puntual']
+  codigo_distrito_acotado varchar(8) [null]
+  codigo_circuito_acotado varchar(12) [null]
+  codigo_amie_acotado varchar(8) [null, note: 'FK a catalogo_territorio_sede.codigo_amie']
+  fecha_inicio_vigencia date [not null, default: `CURRENT_DATE`]
+  fecha_fin_vigencia date [null, note: 'CHECK: fecha_fin_vigencia IS NULL OR fecha_fin_vigencia >= fecha_inicio_vigencia']
+  motivo_asignacion varchar(255) [null]
+  activo boolean [not null, default: true]
+  asignado_por uuid [not null, note: 'FK a persona_identidad.id_interno']
+  creado_en timestamptz [not null, default: `now()`]
+  actualizado_en timestamptz [not null, default: `now()`]
+
+  indexes {
+    (id_interno, cuenta_id, aplicacion_id, rol_id, perfil_id, codigo_zona_acotado, codigo_distrito_acotado, codigo_circuito_acotado, codigo_amie_acotado) [unique, name: 'uq_usuario_rol_ambito_activo', note: 'UNIQUE NULLS NOT DISTINCT WHERE activo = true (impide duplicados activos del mismo rol/perfil y ambito)']
+    (id_interno, aplicacion_id, activo) [name: 'idx_usuario_rol_app_activo']
+  }
+
+  Note: '[ETAPA 2 — migrations/005] Asignacion directa nominal de un rol (`rol_id`) o perfil (`perfil_id`) especifico del aplicativo (`RF-GI-04`, `RF-AUZ-04`) con soporte de acotamiento territorial (`zona`, `distrito`, `circuito`, `amie`), vigencia validada y restriccion unica anti-duplicados.'
+}
+
+// =============================================================================
+// ETAPA 3 — GRUPO 3: SEGURIDAD CRIPTOGRAFICA OIDC (DA-11), M2M, JWKS Y PUBLICADOR INFRA
+// Sincronizado con migrations/004 y Feature 004 (motor-pdp)
+// Color: Purpura Seguridad (#6a1b9a)
+// =============================================================================
+
+Table cliente_oidc [headercolor: #6a1b9a] {
+  cliente_oidc_id uuid [pk, not null, default: `gen_random_uuid()`]
+  aplicacion_id uuid [not null, note: 'FK a aplicacion.aplicacion_id (1 cliente OIDC exclusivo por aplicacion registrada — uq_cliente_oidc_aplicacion, DA-11)']
+  oidc_client_id varchar(128) [unique, not null, note: 'Identificador OIDC para Authorization Code + PKCE S256 contra sso-oidc']
+  secreto_activo_hash char(64) [null, note: 'SHA-256 hex del client_secret OIDC (NULL si metodo_autenticacion_token = none)']
+  secreto_anterior_hash char(64) [null, note: 'SHA-256 hex para ventana de gracia dual sin downtime']
+  gracia_hasta timestamptz [null]
+  expira_rotacion_en timestamptz [null, note: 'Rotacion <= 90 dias para clientes confidenciales']
+  metodo_autenticacion_token varchar(32) [not null, default: 'client_secret_basic', note: 'CHECK: client_secret_basic | client_secret_post | none']
+  estado_cliente varchar(24) [not null, default: 'ACTIVO', note: 'CHECK: ACTIVO | EN_ROTACION_GRACIA | REVOCADO']
+  creado_en timestamptz [not null, default: `now()`]
+  actualizado_en timestamptz [not null, default: `now()`]
+
+  indexes {
+    (aplicacion_id) [unique, name: 'uq_cliente_oidc_aplicacion']
+    (aplicacion_id, estado_cliente) [name: 'idx_cliente_oidc_aplicacion_estado']
+  }
+
+  Note: '[ETAPA 3 — DA-11 / migrations/004] Clientes OIDC registrados en sso-oidc (oidc-provider). Emite ID Tokens RS256 con aud = oidc_client_id exclusivo por aplicacion.'
+}
+
+Table cliente_oidc_redirect_uri [headercolor: #6a1b9a] {
+  redirect_uri_id uuid [pk, not null, default: `gen_random_uuid()`]
+  cliente_oidc_id uuid [not null, note: 'FK a cliente_oidc.cliente_oidc_id ON DELETE CASCADE']
+  tipo_uri varchar(24) [not null, default: 'LOGIN_CALLBACK', note: 'CHECK: LOGIN_CALLBACK | POST_LOGOUT | BACKCHANNEL_LOGOUT']
+  uri varchar(512) [not null, note: '1FN Estricta: URL HTTPS exacta autorizada (sin arrays multivaluados)']
+  activo boolean [not null, default: true]
+  creado_en timestamptz [not null, default: `now()`]
+
+  indexes {
+    (cliente_oidc_id, tipo_uri, uri) [unique, name: 'uq_cliente_oidc_tipo_uri']
+    (cliente_oidc_id, tipo_uri, activo) [name: 'idx_cliente_oidc_redirect_lookup']
+  }
+
+  Note: '[ETAPA 3 — DA-11 / migrations/004] Normalizacion 1FN/3FN de las URLs de retorno (redirect_uris y post_logout_redirect_uris) por cliente OIDC en AlloyDB, sin limite de 100 URIs de GCP.'
+}
+
+Table credencial_m2m [headercolor: #6a1b9a] {
+  credencial_id uuid [pk, not null, default: `gen_random_uuid()`]
+  aplicacion_id uuid [null, note: 'FK a aplicacion.aplicacion_id (NOT NULL si tipo_cliente = APLICACION_PATRON_1; NULL si tipo_cliente = PEP_PATRON_2 transversal)']
+  tipo_cliente varchar(24) [not null, default: 'APLICACION_PATRON_1', note: 'CHECK: APLICACION_PATRON_1 | PEP_PATRON_2']
+  client_id varchar(128) [unique, not null, note: 'Identificador OAuth2 client_credentials']
+  secreto_activo_hash char(64) [not null, note: 'SHA-256 hex (prohibido guardar secreto en texto plano)']
+  secreto_anterior_hash char(64) [null, note: 'SHA-256 hex para ventana de gracia dual sin downtime']
+  gracia_hasta timestamptz [null]
+  expira_rotacion_en timestamptz [not null, note: 'Politica constitucional: rotacion obligatoria <= 90 dias']
+  scopes_permitidos varchar(255) [not null, default: 'pdp:evaluate', note: 'Lista separada por espacios segun RFC 6749 (DA-12: pdp:evaluate)']
+  estado_credencial varchar(24) [not null, default: 'ACTIVA', note: 'CHECK: ACTIVA | EN_ROTACION_GRACIA | REVOCADA']
+  creado_en timestamptz [not null, default: `now()`]
+  actualizado_en timestamptz [not null, default: `now()`]
+
+  indexes {
+    (aplicacion_id) [unique, name: 'uq_credencial_m2m_aplicacion', note: 'WHERE aplicacion_id IS NOT NULL']
+    (estado_credencial) [name: 'idx_credencial_m2m_estado']
+  }
+
+  Note: '[ETAPA 3 — Feature 004] Credenciales M2M (POST /api/v1/oauth/token) con hashes SHA-256, soporte de cliente de aplicacion (PATRON 1) o PEP transversal (PATRON 2) y rotacion dual <= 90 dias.'
+}
+
+Table llave_jwks_rotacion [headercolor: #6a1b9a] {
+  kid varchar(64) [pk, not null, note: 'Key ID publicado en /jwks (sso-oidc) o /.well-known/jwks.json (motor-pdp)']
+  servicio_emisor varchar(24) [not null, default: 'SSO_OIDC', note: 'CHECK: SSO_OIDC | MOTOR_PDP (segregacion criptografica por emisor)']
+  algoritmo varchar(16) [not null, default: 'RS256', note: 'CHECK: RS256']
+  secret_manager_version varchar(255) [not null, note: 'Referencia en Google Secret Manager (cero llaves privadas en BD)']
+  public_jwk_json jsonb [not null, note: 'Clave publica JWK RS256 para verificacion de id_token (SSO_OIDC), X-Minedec-Assertion y JWT M2M (MOTOR_PDP)']
+  estado_llave varchar(24) [not null, note: 'CHECK: ACTIVA_FIRMA | GRACIA_VERIFICACION | RETIRADA | REVOCADA']
+  activada_en timestamptz [not null, default: `now()`]
+  expira_rotacion_en timestamptz [not null, note: 'CHECK: expira_rotacion_en <= activada_en + INTERVAL 90 days']
+  retirada_en timestamptz [null]
+
+  indexes {
+    (servicio_emisor) [unique, name: 'uq_llave_jwks_activa_por_emisor', note: 'WHERE estado_llave = ACTIVA_FIRMA']
+    (servicio_emisor, estado_llave) [name: 'idx_llave_jwks_emisor_estado']
+  }
+
+  Note: '[ETAPA 3 — migrations/004] Metadatos de llaves asimetricas RS256 segregadas por servicio_emisor (SSO_OIDC vs MOTOR_PDP) con ventana de gracia dual (<= 90d) y revocacion de emergencia.'
+}
+
+Table publicacion_infra [headercolor: #6a1b9a] {
+  publicacion_id uuid [pk, not null, default: `gen_random_uuid()`]
+  aplicacion_id uuid [not null]
+  version_catalogo integer [not null]
+  estado_despliegue varchar(32) [not null, note: 'CHECK: EN_COLA | EJECUTANDO_TERRAFORM | PUBLICADO | FALLIDO | ROLLBACK']
+  infra_manager_deployment_id varchar(255) [null, note: 'Deployment ID en Google Cloud Infrastructure Manager']
+  snapshot_tfvars jsonb [not null, note: 'Variables declarativas inyectadas al blueprint Terraform (sin secretos)']
+  resumen_error text [null]
+  solicitada_por uuid [not null, note: 'FK a persona_identidad.id_interno (Superadmin o Admin de Aplicativo)']
+  iniciada_en timestamptz [not null, default: `now()`]
+  finalizada_en timestamptz [null]
+
+  Note: '[ETAPA 3] Historial de despliegues del Publicador de Aplicaciones (Spec 008), serializado con pg_try_advisory_lock en AlloyDB.'
+}
+
+// =============================================================================
+// GRUPO 4: CACHE L2 MEMORYSTORE FOR REDIS (PROYECCIONES DE LECTURA <= 300 s)
+// Color: Naranja Velocidad L2 (#ef6c00) — NO SON TABLAS SQL, VIVEN EN REDIS
+// =============================================================================
+
+Table redis_l2_pip_identity [headercolor: #ef6c00] {
+  redis_key varchar(160) [pk, not null, note: 'pip:identity:sub:{sub} | pip:identity:email:{email} | pip:identity:doc:{tipo}:{num}']
+  id_interno uuid [not null, note: 'Proyectado desde persona_identidad.id_interno']
+  cuenta_id uuid [not null, note: 'Proyectado desde cuenta_institucional.cuenta_id']
+  estado_efectivo varchar(32) [not null, note: 'SINCRONIZADA | REGISTRO_CALIENTE | SUSPENDIDA_GWS | ELIMINADA_GWS | VIGENCIA_VENCIDA | BLOQUEADA_ANOMALIA (alineado con cuenta_institucional.estado_sincronizacion)']
+  expediente_21_atributos_json jsonb [not null, note: 'DTO desnormalizado de persona natural (< 1 ms): persona_identidad + cuenta_institucional + amies_asignados[] (cero RUC)']
+  ttl_segundos integer [not null, default: 300, note: 'Limite duro constitucional <= 300 s (5 min)']
+  invalidacion_pubsub_topico varchar(64) [not null, default: 'conecta-cache-invalidation', note: 'Purga reactiva UNLINK en < 5 s ante baja o cambio de sede']
+
+  Note: '[ETAPA 1 — MEMORYSTORE FOR REDIS 7.x] Proyeccion Key-Value en RAM para resolver identidad de personas naturales en < 15 ms p95 con 0 llamadas a Google Workspace.'
+}
+
+Table redis_l2_pdp_app_bundle [headercolor: #ef6c00] {
+  redis_key varchar(160) [pk, not null, note: 'minedec:pdp:bundle:{aplicacion_codigo}']
+  aplicacion_id uuid [not null, note: 'Proyectado desde aplicacion.aplicacion_id']
+  version_catalogo integer [not null, note: 'Sincronizado con aplicacion.version_catalogo']
+  modo_sombra boolean [not null, default: false, note: 'Proyectado desde aplicacion.modo_sombra']
+  rutas_ordenadas_json jsonb [not null, note: 'Rutas pre-ordenadas por especificidad (EXACTA > PREFIJO > EXTENSION) + modo_evaluacion_permisos + modo_sombra']
+  grupos_logicos_ast_json jsonb [not null, note: 'Reglas RBAC x ABAC (AST) precompiladas + mapa de roles, perfiles, permisos atomicos y banderas CRUD']
+  ttl_segundos integer [not null, default: 300, note: 'TTL <= 300 s + invalidacion UNLINK al editar politicas en PAP']
+
+  Note: '[ETAPA 2 — MEMORYSTORE FOR REDIS 7.x] Bundle Key-Value en RAM de rutas y reglas RBAC x ABAC por aplicacion para evaluacion en < 5 ms.'
+}
+
+Table redis_l2_pdp_authz_decision [headercolor: #ef6c00] {
+  redis_key varchar(160) [pk, not null, note: 'minedec:pdp:decision:{aplicacion_codigo}:{id_interno}:{cuenta_id}:{version_catalogo}']
+  id_interno uuid [not null, note: 'Ref logica a persona_identidad.id_interno']
+  cuenta_id uuid [not null, note: 'Ref logica a cuenta_institucional.cuenta_id (separa contexto Docente vs Estudiante)']
+  aplicacion_id uuid [not null, note: 'Ref logica a aplicacion.aplicacion_id']
+  roles_efectivos_json jsonb [not null, note: 'Union aditiva de roles por Grupo Logico RBACxABAC + Perfiles + usuario_rol_aplicacion']
+  permisos_efectivos_json jsonb [not null, note: 'Conjunto de codigos de permiso_atomico habilitados']
+  permisos_crud_json jsonb [not null, note: 'Mapa de capacidades CRUD efectivas por permiso (agregadas con bool_or)']
+  scoping_territorial_json jsonb [not null, note: '{codigo_zona, codigo_distrito, codigo_circuito, codigo_amie, amies_asignados[]} (exclusivo personas naturales, cero RUC)']
+  ttl_segundos integer [not null, default: 300, note: 'TTL = min(300s, segundos_hasta_fin_vigencia)']
+
+  Note: '[ETAPA 2 — MEMORYSTORE FOR REDIS 7.x] Resultado Key-Value precalculado Persona x Cuenta x Aplicacion para POST /api/v1/access/evaluation. Al incluir `{id_interno}` en la clave y mantener indice por sujeto, el suscriptor Pub/Sub purga en < 5 s todas las decisiones cacheadas del usuario.'
+}
+
+Table redis_l2_oidc_session [headercolor: #ef6c00] {
+  redis_key varchar(255) [pk, not null, note: 'minedec:oidc:session:{sessionId} + testigo separado minedec:oidc:reval:{sessionId}']
+  cuenta_id uuid [not null, note: 'Ref logica a cuenta_institucional.cuenta_id']
+  id_interno uuid [not null, note: 'Ref logica a persona_identidad.id_interno']
+  email_principal varchar(254) [not null]
+  google_sub_id varchar(64) [not null, note: 'Alineado con cuenta_institucional.google_sub_id VARCHAR(64)']
+  participating_client_ids jsonb [not null, note: 'Lista de oidc_client_id participantes en la sesion SSO para Single Logout']
+  last_pip_validated_at timestamptz [not null, note: 'Revalidacion obligatoria contra PIP cada <= 300 s']
+  ttl_seconds integer [not null, default: 28800, note: 'Duracion maxima de la sesion SSO central (8 horas / 28800 s)']
+  reval_ttl_seconds integer [not null, default: 300, note: 'TTL duro <= 300 s de la clave testigo minedec:oidc:reval:{sessionId} que garantiza revocacion verificable <= 300 s (RF-GI-06, PI-07)']
+
+  Note: '[ETAPA 3 — MEMORYSTORE FOR REDIS 7.x] Sesion central OIDC (`minedec:oidc:session:{sessionId}`, 8 h) gobernada por el testigo de revalidacion (`minedec:oidc:reval:{sessionId}`, TTL <= 300 s) y purgada inmediatamente via Pub/Sub.'
+}
+
+Table redis_l2_oidc_auth_code [headercolor: #ef6c00] {
+  redis_key varchar(255) [pk, not null, note: 'minedec:oidc:adapter:AuthorizationCode:{codeId}']
+  session_id varchar(128) [not null]
+  oidc_client_id varchar(128) [not null]
+  code_challenge varchar(128) [not null, note: 'PKCE S256 obligatorio']
+  code_challenge_method varchar(16) [not null, default: 'S256']
+  redirect_uri varchar(512) [not null]
+  consumed_at timestamptz [null, note: 'Single-use estricto: reuso detecta replay y revoca la sesion central']
+  ttl_seconds integer [not null, default: 60, note: 'Maximo duro <= 60 s']
+
+  Note: '[ETAPA 3 — MEMORYSTORE FOR REDIS 7.x] Codigos de autorizacion OIDC de un solo uso con PKCE S256 y deteccion de replay (Spec 003).'
+}
+
+Table redis_l2_oidc_session_index [headercolor: #ef6c00] {
+  redis_key varchar(255) [pk, not null, note: 'minedec:oidc:account_sessions:{cuentaId} | minedec:oidc:person_sessions:{idInterno}']
+  id_interno uuid [not null, note: 'Ref logica a persona_identidad.id_interno']
+  session_ids_json jsonb [not null, note: 'Lista de sessionId activos para purga atomica ante baja o suspension']
+  ttl_seconds integer [not null, default: 300]
+
+  Note: '[ETAPA 3 — MEMORYSTORE FOR REDIS 7.x] Indices invertidos de sesiones OIDC por cuenta y por persona para revocacion inmediata via Pub/Sub.'
+}
+
+// =============================================================================
+// GRUPO 5: AUDITORIA INMUTABLE EN 3 CAPAS (ALLOYDB + BIGQUERY + GCS WORM)
+// Color: Gris Forense (#37474f) — Transversal desde Etapa 1
+// =============================================================================
+
+Table auditoria_evento [headercolor: #37474f] {
+  evento_id uuid [pk, not null, default: `gen_random_uuid()`]
+  tipo_evento varchar(64) [not null, note: 'CHECK: Eventos transaccionales PIP, Sincronizador, Conciliacion, SSO_OIDC_BROKER, PAP_ADMIN y eventos de seguridad/control de PDP_MOTOR (PDP_TOKEN_M2M_EMITIDO, PDP_TOKEN_M2M_RECHAZADO, PDP_CACHE_INVALIDADO_PUBSUB, PDP_RECHAZO_SEGURIDAD_RUTA)']
+  actor_id_interno uuid [null, note: 'FK opcional a persona_identidad.id_interno (NULL si es job de sistema o evaluacion no autenticada)']
+  actor_identificacion varchar(64) [not null, note: 'Cedula/Pasaporte, client_id M2M o Service Account ejecutora']
+  sujeto_identificacion varchar(64) [null]
+  correo_afectado varchar(254) [null]
+  origen_canal varchar(32) [not null, note: 'CHECK: PIP_INGEST | LOGIN_JIT | PDP_MOTOR | PAP_ADMIN | SYNC_INCREMENTAL | SYNC_BATCH_JOB | SINCRONIZADOR_GWS | SSO_OIDC_BROKER']
+  entidad_afectada varchar(64) [not null]
+  registro_afectado_id varchar(128) [not null]
+  valores_anteriores jsonb [null]
+  valores_nuevos jsonb [null, note: 'Payload sanitizado (cero secretos, cero latencia)']
+  hash_evento_anterior_sha256 char(64) [not null, note: 'Hash SHA-256 del evento inmediato anterior (serializado con pg_advisory_xact_lock)']
+  hash_evento_sha256 char(64) [unique, not null, note: 'Hash SHA-256 actual protegido por trigger trg_enforce_auditoria_append_only']
+  fecha_evento timestamptz [not null, default: `now()`]
+
+  indexes {
+    (sujeto_identificacion, fecha_evento) [name: 'idx_auditoria_sujeto_fecha']
+    (actor_identificacion, fecha_evento) [name: 'idx_auditoria_actor_fecha']
+    (tipo_evento, fecha_evento) [name: 'idx_auditoria_tipo_fecha']
+  }
+
+  Note: '[ETAPA 1 — CAPA 1 ALLOYDB APPEND-ONLY / migrations/001..005] Tabla SQL transaccional con REVOKE UPDATE, DELETE, TRUNCATE y encadenamiento SHA-256 (`pg_advisory_xact_lock`). Reservada para mutaciones de identidad/gobierno, credenciales M2M, rotacion JWKS y rechazos de seguridad; las evaluaciones de alta frecuencia de `/api/v1/access/evaluation` fluyen por streaming asincrono directo a `bq_auditoria_analitica_append_only` y `gcs_worm_archivo_forense` para no serializar la ruta critica `< 15 ms`.'
+}
+
+Table bq_auditoria_analitica_append_only [headercolor: #37474f] {
+  evento_id uuid [pk, not null, note: 'UUID del evento (proveniente de auditoria_evento o emitido por streaming en /api/v1/access/evaluation: PDP_EVALUACION_PERMIT, PDP_EVALUACION_DENY, PDP_EVALUACION_SHADOW_PERMIT)']
+  auditoria_evento_id uuid [null, note: 'FK logica opcional a auditoria_evento.evento_id cuando el evento tambien se persistio en Capa 1 AlloyDB']
+  particion_fecha date [not null, note: 'Particionamiento diario en BigQuery (retencion >= 5 anos)']
+  tipo_evento varchar(64) [not null]
+  actor_identificacion varchar(64) [not null]
+  sujeto_identificacion varchar(64) [null]
+  aplicacion_codigo varchar(64) [null]
+  decision_pdp varchar(16) [null, note: 'PERMIT | DENY']
+  codigo_razon_pdp varchar(64) [null]
+  hash_evento_sha256 char(64) [not null]
+  archivo_worm_uri varchar(512) [null, note: 'Puntero al bloque horario/diario exportado en Cloud Storage WORM (NULL mientras el lote sigue en ventana de agregacion)']
+
+  Note: '[ETAPA 1 — CAPA 2 BIGQUERY APPEND-ONLY] Dataset analitico con deletion_protection = true, IAM segregado sin roles de borrado y cero campos de latencia de aplicacion (Constitucion V.4 y XV).'
+}
+
+Table gcs_worm_archivo_forense [headercolor: #37474f] {
+  objeto_gcs_uri varchar(512) [pk, not null, note: 'gs://minedec-sso-audit-worm/YYYY/MM/DD/batch-{uuid}.jsonl.gz']
+  hash_lote_sha256 char(64) [unique, not null, note: 'Merkle/Batch SHA-256 de los eventos contenidos']
+  retention_policy_locked boolean [not null, default: true, note: 'Bucket Lock inmutable (is_locked = true)']
+  retencion_minima_anos integer [not null, default: 5]
+  exportado_en timestamptz [not null, default: `now()`]
+
+  Note: '[ETAPA 1 — CAPA 3 CLOUD STORAGE WORM] Custodia forense legal inalterable con Bucket Lock activado (is_locked = true).'
+}
+
+// =============================================================================
+// RELACIONES (FOREIGN KEYS 3FN + AISLAMIENTO MULTI-APP + FLUJO CACHE L2 Y AUDITORIA)
+// =============================================================================
+
+// --- Relaciones Etapa 1: PIP Identidad, Territorio y Conciliacion (3FN) ---
+Ref: cuenta_institucional.id_interno > persona_identidad.id_interno
+Ref: cuenta_institucional.dominio > dominio_institucional.dominio
+Ref: asignacion_contexto.id_interno > persona_identidad.id_interno
+Ref: asignacion_contexto.(cuenta_id, id_interno) > cuenta_institucional.(cuenta_id, id_interno)
+Ref: asignacion_contexto.codigo_amie > catalogo_territorio_sede.codigo_amie
+Ref: anomalia_identidad.id_interno > persona_identidad.id_interno
+Ref: anomalia_identidad.cuenta_id > cuenta_institucional.cuenta_id
+Ref: anomalia_identidad.anomalia_anterior_id > anomalia_identidad.anomalia_id
+Ref: checkpoint_conciliacion.dominio > dominio_institucional.dominio
+
+// --- Relaciones Etapa 2: PAP y RBAC + ABAC con Aislamiento Multi-App por FK Compuesta ---
+Ref: aplicacion.creado_por > persona_identidad.id_interno
+Ref: administrador_aplicativo.aplicacion_id > aplicacion.aplicacion_id
+Ref: administrador_aplicativo.id_interno > persona_identidad.id_interno
+Ref: administrador_aplicativo.asignado_por > persona_identidad.id_interno
+Ref: ruta_catalogo.aplicacion_id > aplicacion.aplicacion_id
+Ref: permiso_atomico.aplicacion_id > aplicacion.aplicacion_id
+Ref: ruta_permiso_requerido.(aplicacion_id, ruta_id) > ruta_catalogo.(aplicacion_id, ruta_id)
+Ref: ruta_permiso_requerido.(aplicacion_id, permiso_id) > permiso_atomico.(aplicacion_id, permiso_id)
+Ref: rol.aplicacion_id > aplicacion.aplicacion_id
+Ref: rol_permiso.(aplicacion_id, rol_id) > rol.(aplicacion_id, rol_id)
+Ref: rol_permiso.(aplicacion_id, permiso_id) > permiso_atomico.(aplicacion_id, permiso_id)
+Ref: perfil.aplicacion_id > aplicacion.aplicacion_id
+Ref: perfil_rol.(aplicacion_id, perfil_id) > perfil.(aplicacion_id, perfil_id)
+Ref: perfil_rol.(aplicacion_id, rol_id) > rol.(aplicacion_id, rol_id)
+Ref: grupo_logico.aplicacion_id > aplicacion.aplicacion_id
+Ref: grupo_logico.creado_por > persona_identidad.id_interno
+Ref: grupo_logico_rol.(aplicacion_id, grupo_logico_id) > grupo_logico.(aplicacion_id, grupo_logico_id)
+Ref: grupo_logico_rol.(aplicacion_id, rol_id) > rol.(aplicacion_id, rol_id)
+Ref: grupo_logico_perfil.(aplicacion_id, grupo_logico_id) > grupo_logico.(aplicacion_id, grupo_logico_id)
+Ref: grupo_logico_perfil.(aplicacion_id, perfil_id) > perfil.(aplicacion_id, perfil_id)
+Ref: usuario_rol_aplicacion.id_interno > persona_identidad.id_interno
+Ref: usuario_rol_aplicacion.(cuenta_id, id_interno) > cuenta_institucional.(cuenta_id, id_interno)
+Ref: usuario_rol_aplicacion.asignado_por > persona_identidad.id_interno
+Ref: usuario_rol_aplicacion.(aplicacion_id, rol_id) > rol.(aplicacion_id, rol_id)
+Ref: usuario_rol_aplicacion.(aplicacion_id, perfil_id) > perfil.(aplicacion_id, perfil_id)
+Ref: usuario_rol_aplicacion.codigo_amie_acotado > catalogo_territorio_sede.codigo_amie
+
+// --- Relaciones Etapa 3: Seguridad OIDC (DA-11), M2M y Publicador Infra ---
+Ref: cliente_oidc.aplicacion_id > aplicacion.aplicacion_id
+Ref: cliente_oidc_redirect_uri.cliente_oidc_id > cliente_oidc.cliente_oidc_id
+Ref: credencial_m2m.aplicacion_id > aplicacion.aplicacion_id
+Ref: publicacion_infra.aplicacion_id > aplicacion.aplicacion_id
+Ref: publicacion_infra.solicitada_por > persona_identidad.id_interno
+
+// --- Relaciones Grupo 4: Proyecciones hacia Cache L2 Redis ---
+Ref: redis_l2_pip_identity.id_interno > persona_identidad.id_interno
+Ref: redis_l2_pip_identity.cuenta_id > cuenta_institucional.cuenta_id
+Ref: redis_l2_pdp_app_bundle.aplicacion_id - aplicacion.aplicacion_id
+Ref: redis_l2_pdp_authz_decision.id_interno > persona_identidad.id_interno
+Ref: redis_l2_pdp_authz_decision.cuenta_id > cuenta_institucional.cuenta_id
+Ref: redis_l2_pdp_authz_decision.aplicacion_id > aplicacion.aplicacion_id
+Ref: redis_l2_oidc_session.id_interno > persona_identidad.id_interno
+Ref: redis_l2_oidc_session.cuenta_id > cuenta_institucional.cuenta_id
+Ref: redis_l2_oidc_session_index.id_interno > persona_identidad.id_interno
+
+// --- Relaciones Grupo 5: Cadena de Auditoria Inmutable (3 Capas) ---
+Ref: auditoria_evento.actor_id_interno > persona_identidad.id_interno
+Ref: bq_auditoria_analitica_append_only.auditoria_evento_id > auditoria_evento.evento_id
+Ref: bq_auditoria_analitica_append_only.archivo_worm_uri > gcs_worm_archivo_forense.objeto_gcs_uri
+
+// =============================================================================
+// AGRUPACIONES VISUALES POR ETAPA PARA DBDIAGRAM.IO
+// =============================================================================
+
+TableGroup "Etapa_1_PIP_Identidad_Territorio_y_Conciliacion_3FN" {
+  dominio_institucional
+  catalogo_atributo_minedec
+  catalogo_territorio_sede
+  persona_identidad
+  cuenta_institucional
+  asignacion_contexto
+  anomalia_identidad
+  checkpoint_conciliacion
+  evento_sincronizacion_procesado
+  registro_fallo_sincronizacion
+}
+
+TableGroup "Etapa_2_PAP_Autorizacion_RBAC_ABAC" {
+  aplicacion
+  administrador_aplicativo
+  ruta_catalogo
+  permiso_atomico
+  ruta_permiso_requerido
+  rol
+  rol_permiso
+  perfil
+  perfil_rol
+  grupo_logico
+  grupo_logico_rol
+  grupo_logico_perfil
+  usuario_rol_aplicacion
+}
+
+TableGroup "Etapa_3_Seguridad_OIDC_M2M_JWKS_e_Infra" {
+  cliente_oidc
+  cliente_oidc_redirect_uri
+  credencial_m2m
+  llave_jwks_rotacion
+  publicacion_infra
+}
+
+TableGroup "Cache_L2_Memorystore_Redis" {
+  redis_l2_pip_identity
+  redis_l2_pdp_app_bundle
+  redis_l2_pdp_authz_decision
+  redis_l2_oidc_session
+  redis_l2_oidc_auth_code
+  redis_l2_oidc_session_index
+}
+
+TableGroup "Auditoria_Transversal_Inmutable_3_Capas" {
+  auditoria_evento
+  bq_auditoria_analitica_append_only
+  gcs_worm_archivo_forense
+}

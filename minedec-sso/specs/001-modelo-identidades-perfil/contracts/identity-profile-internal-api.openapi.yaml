@@ -1,0 +1,946 @@
+openapi: 3.1.0
+info:
+  title: Conecta MINEDEC (C2.2) — API Interna del PIP (Base de Identidades, Esquema MINEDEC_Perfil, Catálogos y Bandeja de Anomalías)
+  version: 1.0.0
+  description: |
+    Contrato OpenAPI 3.1 de las interfaces internas y administrativas del **Policy Information Point (PIP)** de la feature `001-modelo-identidades-perfil`:
+    1. **Resolución Interna de Identidad Unificada y Registro en Caliente (`REGISTRO_CALIENTE`)** para el Motor PDP (`POST /internal/v1/pip/identities/resolve`), con latencia `< 15 ms` p95 y `0` llamadas salientes a Google Workspace.
+    2. **Ingesta / Actualización Idempotente de Perfil (`MINEDEC_Perfil`)** consumida por el Sincronizador (`002-sincronizador-conciliacion-gws`) para persistir los 21 atributos, resolver identidades provisionales `PENDIENTE_IDENTIFICACION`, ejecutar transiciones `CODIGO_MINEDEC` → `CEDULA`, auto-resolver anomalías de datos y purgar la caché L2 Redis en `< 5 s` (`PUT /internal/v1/pip/identities/upsert`).
+    3. **Endpoints Administrativos del PAP** para consulta de identidades unificadas, gestión de asignaciones multisede (`amies_asignados`), bandeja de anomalías de identidad (`ABIERTA`, `LISTA_PARA_CERRAR`, `RESUELTA`) y catálogos parametrizables (`D-03` con relación jerárquica `tipoUsuario` → `subtipoUsuario`).
+servers:
+  - url: https://pip-internal.conecta.educacion.gob.ec
+    description: Servicio Interno del PIP (GKE Autopilot)
+
+security:
+  - InternalServiceJwt: []
+
+paths:
+  /internal/v1/pip/identities/resolve:
+    post:
+      operationId: resolveOrHotRegisterIdentity
+      summary: Resuelve una identidad unificada desde AlloyDB/Redis o aplica Registro en Caliente (REGISTRO_CALIENTE) sin consultar Google Workspace
+      tags:
+        - PIP Internal (PDP Integration)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ResolveIdentityRequest'
+      responses:
+        '200':
+          description: Identidad resuelta exitosamente desde el PIP local (AlloyDB / Redis L2)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ResolvedIdentityResponse'
+        '202':
+          description: Cuenta no encontrada en PIP; registrada en REGISTRO_CALIENTE con PersonaIdentidad provisional (PENDIENTE_IDENTIFICACION, acceso RESTRINGIDA) y sincronización prioritaria encolada
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ResolvedIdentityResponse'
+        '403':
+          description: Acceso denegado (fail-close) por cuenta SUSPENDIDA_GWS, VIGENCIA_VENCIDA o anomalía BLOQUEANTE (SIN_IDENTIFICACION_VALIDA / COLISION_IDENTIFICADOR / VIGENCIA_INVALIDA)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /internal/v1/pip/identities/upsert:
+    put:
+      operationId: upsertWorkspaceAccountProfile
+      summary: Persiste de forma idempotente una cuenta institucional y sus 21 atributos MINEDEC_Perfil, ejecutando unificación multi-dominio, transición CODIGO_MINEDEC -> CEDULA, evaluación de anomalías e invalidación Redis L2 (< 5 s)
+      tags:
+        - PIP Internal (Sync Ingestion Contract)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UpsertWorkspaceAccountRequest'
+      responses:
+        '200':
+          description: Cuenta y PersonaIdentidad procesadas e invalidadas en caché L2 exitosamente
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UpsertWorkspaceAccountResponse'
+
+  /api/v1/admin/identities/{numeroIdentificacion}:
+    get:
+      operationId: getUnifiedIdentityByIdentification
+      summary: Consulta la identidad unificada (PersonaIdentidad), cuentas multi-dominio y contextos territoriales/organizacionales activos
+      tags:
+        - PAP Admin (Identities & Contexts)
+      parameters:
+        - name: numeroIdentificacion
+          in: path
+          required: true
+          schema:
+            type: string
+            pattern: '^[A-Z0-9-]{5,20}$'
+        - name: tipoIdentificacion
+          in: query
+          required: false
+          schema:
+            $ref: '#/components/schemas/TipoIdentificacionPersona'
+      responses:
+        '200':
+          description: Detalle de la identidad unificada
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UnifiedIdentityAdminView'
+        '404':
+          description: Identidad no encontrada
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /api/v1/admin/identities/{numeroIdentificacion}/context-assignments:
+    post:
+      operationId: assignComplementaryContext
+      summary: Asigna una sede AMIE complementaria (amies_asignados) o unidad administrativa delegada en el PAP
+      tags:
+        - PAP Admin (Identities & Contexts)
+      parameters:
+        - name: numeroIdentificacion
+          in: path
+          required: true
+          schema:
+            type: string
+            pattern: '^[A-Z0-9-]{5,20}$'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateContextAssignmentRequest'
+      responses:
+        '201':
+          description: Asignación de contexto creada e invalidada en caché L2
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ContextAssignmentView'
+
+  /api/v1/admin/anomalies:
+    get:
+      operationId: listIdentityAnomalies
+      summary: Lista paginada de la Bandeja de Anomalías de Identidad para Superadministradores de Seguridad
+      tags:
+        - PAP Admin (Anomalies & Governance)
+      parameters:
+        - name: estadoAnomalia
+          in: query
+          schema:
+            type: string
+            enum: [ABIERTA, EN_REVISION, LISTA_PARA_CERRAR, RESUELTA, DESCARTADA]
+        - name: efectoAcceso
+          in: query
+          schema:
+            type: string
+            enum: [BLOQUEANTE, RESTRINGIDA]
+        - name: codigoCausal
+          in: query
+          schema:
+            $ref: '#/components/schemas/CodigoCausalAnomalia'
+        - name: dominio
+          in: query
+          schema:
+            type: string
+        - name: pageSize
+          in: query
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 100
+            default: 50
+        - name: cursor
+          in: query
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Lista de anomalías de identidad
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AnomalyListResponse'
+
+  /api/v1/admin/anomalies/{anomaliaId}/resolve:
+    post:
+      operationId: resolveIdentityAnomalyManually
+      summary: Cierre explícito manual (MANUAL_ADMIN) de una anomalía (obligatorio para desbloquear COLISION_IDENTIFICADOR en estado LISTA_PARA_CERRAR)
+      tags:
+        - PAP Admin (Anomalies & Governance)
+      parameters:
+        - name: anomaliaId
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ManualResolveAnomalyRequest'
+      responses:
+        '200':
+          description: Anomalía cerrada manualmente, estado de identidad recalculado y caché Redis invalidada en < 5 s
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AnomalyItem'
+
+  /api/v1/admin/catalogs/{categoriaAtributo}:
+    get:
+      operationId: listCatalogValues
+      summary: Obtiene los valores vigentes de un catálogo parametrizable de MINEDEC_Perfil (D-03)
+      tags:
+        - PAP Admin (Catalogs)
+      parameters:
+        - name: categoriaAtributo
+          in: path
+          required: true
+          schema:
+            $ref: '#/components/schemas/CategoriaCatalogo'
+      responses:
+        '200':
+          description: Valores del catálogo parametrizable
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/CatalogEntry'
+    put:
+      operationId: upsertCatalogValue
+      summary: Crea o actualiza un valor permitido en el catálogo parametrizable sin redespliegue (D-03)
+      tags:
+        - PAP Admin (Catalogs)
+      parameters:
+        - name: categoriaAtributo
+          in: path
+          required: true
+          schema:
+            $ref: '#/components/schemas/CategoriaCatalogo'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CatalogEntryUpsertRequest'
+      responses:
+        '200':
+          description: Valor de catálogo actualizado e invalidado en caché Redis
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CatalogEntry'
+
+  /internal/v1/pip/health/detailed:
+    get:
+      operationId: getDetailedInfrastructureHealthAndDiagnostics
+      summary: Sonda de salud en tiempo real y diagnóstico en lenguaje natural para el Administrador sobre AlloyDB, Redis L2, respaldos PITR y recuperación HA
+      tags:
+        - PIP Observability & Resilience
+      responses:
+        '200':
+          description: Clúster AlloyDB for PostgreSQL 16 operativo (con reporte detallado de respaldos continuos PITR 14 días, HA Regional < 60 s y estado de Redis L2)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DetailedHealthReportResponse'
+        '503':
+          description: Caída o conmutación HA en curso en AlloyDB (postura Fail-Close activa con diagnóstico completo en lenguaje natural para el Administrador)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DetailedHealthReportResponse'
+
+components:
+  securitySchemes:
+    InternalServiceJwt:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: Token OIDC interno de cuenta de servicio GCP o token IAP validado.
+
+  schemas:
+    TipoIdentificacionPersona:
+      type: string
+      enum: [CEDULA, PASAPORTE, CODIGO_MINEDEC]
+
+    TipoIdentificacionEntrada:
+      type: string
+      enum: [CEDULA, PASAPORTE, CODIGO_MINEDEC, RUC]
+      description: En la ingesta desde Google Workspace, si llega RUC de persona natural (10 dígitos + 001..999), el PIP extrae y normaliza los primeros 10 dígitos como CEDULA. Los RUC jurídicos (tercer dígito 6 o 9) se rechazan como anomalía SIN_IDENTIFICACION_VALIDA (BLOQUEANTE).
+
+    CategoriaCatalogo:
+      type: string
+      enum:
+        - TIPO_IDENTIFICACION
+        - TIPO_USUARIO
+        - SUBTIPO_USUARIO
+        - CARGO_FUNCION
+        - GRADO_CURSO
+        - NIVEL_ACADEMICO
+        - VICEMINISTERIO
+        - NIVEL_ESTRUCTURA
+        - REGIMEN_ESCOLAR
+        - MODALIDAD_EDUCATIVA
+        - JORNADA
+
+    CodigoCausalAnomalia:
+      type: string
+      enum:
+        - SIN_IDENTIFICACION_VALIDA
+        - COLISION_IDENTIFICADOR
+        - VIGENCIA_INVALIDA
+        - ATRIBUTO_OBLIGATORIO_FALTANTE
+        - FORMATO_AMIE_INVALIDO
+
+    ResolveIdentityRequest:
+      type: object
+      required:
+        - googleSubId
+        - emailPrincipal
+        - nombreCompleto
+      properties:
+        googleSubId:
+          type: string
+          example: "109876543210987654321"
+        emailPrincipal:
+          type: string
+          format: email
+          example: "juan.perez@educacion.gob.ec"
+        nombreCompleto:
+          type: string
+          example: "Juan Carlos Pérez López"
+        idInterno:
+          type: string
+          format: uuid
+          nullable: true
+        tipoIdentificacion:
+          $ref: '#/components/schemas/TipoIdentificacionPersona'
+        numeroIdentificacion:
+          type: string
+          nullable: true
+
+    ResolvedIdentityResponse:
+      type: object
+      required:
+        - idInterno
+        - tipoIdentificacion
+        - numeroIdentificacion
+        - nombreCompleto
+        - estadoPersona
+        - cuentaActiva
+        - nivelAccesoEfectivo
+        - contextosActivos
+      properties:
+        idInterno:
+          type: string
+          format: uuid
+        tipoIdentificacion:
+          $ref: '#/components/schemas/TipoIdentificacionPersona'
+        numeroIdentificacion:
+          type: string
+          example: "0912345678"
+        codigoMinedecAnterior:
+          type: string
+          nullable: true
+        nombreCompleto:
+          type: string
+        estadoPersona:
+          type: string
+          enum: [ACTIVA, PENDIENTE_IDENTIFICACION, RESTRINGIDA_ANOMALIA, BLOQUEADA_ANOMALIA, INACTIVA]
+        nivelAccesoEfectivo:
+          type: string
+          enum: [COMPLETO, RESTRINGIDA_SOLO_AUTENTICADA, BLOQUEADO]
+        cuentaActiva:
+          type: object
+          required:
+            - cuentaId
+            - emailPrincipal
+            - dominio
+            - estadoSincronizacion
+          properties:
+            cuentaId:
+              type: string
+              format: uuid
+            emailPrincipal:
+              type: string
+            dominio:
+              type: string
+            tipoUsuario:
+              type: string
+              nullable: true
+            subtipoUsuario:
+              type: string
+              nullable: true
+            estadoSincronizacion:
+              type: string
+              enum: [SINCRONIZADA, REGISTRO_CALIENTE, SUSPENDIDA_GWS, VIGENCIA_VENCIDA, BLOQUEADA_ANOMALIA]
+        contextosActivos:
+          type: array
+          items:
+            $ref: '#/components/schemas/ContextAssignmentView'
+        prioritySyncQueued:
+          type: boolean
+          default: false
+
+    UpsertWorkspaceAccountRequest:
+      type: object
+      required:
+        - googleSubId
+        - emailPrincipal
+        - nombreCompleto
+        - orgUnitPath
+        - suspendedEnGws
+        - origenSincronizacion
+      properties:
+        googleSubId:
+          type: string
+        emailPrincipal:
+          type: string
+          format: email
+        givenName:
+          type: string
+          nullable: true
+          example: "Juan Carlos"
+        familyName:
+          type: string
+          nullable: true
+          example: "Pérez López"
+        nombreCompleto:
+          type: string
+        orgUnitPath:
+          type: string
+        suspendedEnGws:
+          type: boolean
+        origenSincronizacion:
+          type: string
+          enum: [EVENTO_AUDIT_LOG, BARRIDO_DELTA_2MIN, CONCILIACION_BATCH, REGISTRO_CALIENTE_PRIORITARIO]
+        minedecPerfil:
+          type: object
+          description: Los atributos personalizados del esquema MINEDEC_Perfil leídos del único tenant de Google Workspace (soporta normalización automática de sinónimos de extracción FO-DNTIC-20 vía catalogo_atributo_minedec e inmutabilidad estricta de CEDULA una vez consolidada; solo admite transición unidireccional CODIGO_MINEDEC -> CEDULA)
+          properties:
+            idInterno:
+              type: string
+              format: uuid
+              nullable: true
+            tipoIdentificacion:
+              $ref: '#/components/schemas/TipoIdentificacionEntrada'
+            numeroIdentificacion:
+              type: string
+            fechaNacimiento:
+              type: string
+              format: date
+              nullable: true
+            tipoUsuario:
+              type: string
+            subtipoUsuario:
+              type: string
+            cargoFuncion:
+              type: string
+              nullable: true
+              example: "DOCENTE_AULA"
+            nivelEstructura:
+              type: string
+            zonaDistritoCircuito:
+              type: string
+              example: "09-09D01-09D01C01"
+            viceministerio:
+              type: string
+              nullable: true
+              example: "EDUCACION"
+            codigoInstitucion:
+              type: string
+              example: "09H00123"
+              nullable: true
+            codigoDependenciaAdmin:
+              type: string
+              nullable: true
+            regimenEscolar:
+              type: string
+              nullable: true
+            nivelAcademico:
+              type: string
+              nullable: true
+            gradoCurso:
+              type: string
+              nullable: true
+            modalidadEducativa:
+              type: string
+              nullable: true
+            jornada:
+              type: string
+              nullable: true
+            docenteMultisede:
+              type: boolean
+              nullable: true
+            representanteLegalCedula:
+              type: string
+              nullable: true
+            fechaInicioVigencia:
+              type: string
+              format: date
+              nullable: true
+            fechaFinVigencia:
+              type: string
+              format: date
+              nullable: true
+
+    UpsertWorkspaceAccountResponse:
+      type: object
+      required:
+        - idInterno
+        - cuentaId
+        - estadoPersona
+        - estadoSincronizacion
+        - cacheInvalidated
+        - anomaliasAbiertas
+      properties:
+        idInterno:
+          type: string
+          format: uuid
+        cuentaId:
+          type: string
+          format: uuid
+        estadoPersona:
+          type: string
+          enum: [ACTIVA, PENDIENTE_IDENTIFICACION, RESTRINGIDA_ANOMALIA, BLOQUEADA_ANOMALIA, INACTIVA]
+        estadoSincronizacion:
+          type: string
+          enum: [SINCRONIZADA, REGISTRO_CALIENTE, SUSPENDIDA_GWS, VIGENCIA_VENCIDA, BLOQUEADA_ANOMALIA]
+        transitionedFromCodigoMinedec:
+          type: boolean
+          default: false
+        cacheInvalidated:
+          type: boolean
+        anomaliasAbiertas:
+          type: array
+          items:
+            $ref: '#/components/schemas/AnomalyItem'
+
+    UnifiedIdentityAdminView:
+      type: object
+      required:
+        - idInterno
+        - tipoIdentificacion
+        - numeroIdentificacion
+        - nombreCompleto
+        - estadoPersona
+        - cuentasInstitucionales
+        - contextosAsignados
+      properties:
+        idInterno:
+          type: string
+          format: uuid
+        tipoIdentificacion:
+          $ref: '#/components/schemas/TipoIdentificacionPersona'
+        numeroIdentificacion:
+          type: string
+        codigoMinedecAnterior:
+          type: string
+          nullable: true
+        nombreCompleto:
+          type: string
+        fechaNacimiento:
+          type: string
+          format: date
+          nullable: true
+        estadoPersona:
+          type: string
+        cuentasInstitucionales:
+          type: array
+          items:
+            type: object
+            properties:
+              cuentaId:
+                type: string
+                format: uuid
+              emailPrincipal:
+                type: string
+              dominio:
+                type: string
+              tipoUsuario:
+                type: string
+              subtipoUsuario:
+                type: string
+              suspendedEnGws:
+                type: boolean
+              estadoSincronizacion:
+                type: string
+        contextosAsignados:
+          type: array
+          items:
+            $ref: '#/components/schemas/ContextAssignmentView'
+
+    CreateContextAssignmentRequest:
+      type: object
+      required:
+        - nivelEstructura
+        - codigoZona
+        - motivoAsignacion
+      properties:
+        nivelEstructura:
+          type: string
+          enum: [PLANTA_CENTRAL, ZONA, DISTRITO, CIRCUITO, INSTITUCION_EDUCATIVA]
+        codigoZona:
+          type: string
+          pattern: '^(0[1-9]|1[0-9]|2[0-4]|90)$'
+          example: "09"
+        codigoDistrito:
+          type: string
+          nullable: true
+          pattern: '^(0[1-9]|1[0-9]|2[0-4]|90)D[0-9]{2}$'
+          example: "09D01"
+        codigoCircuito:
+          type: string
+          nullable: true
+          pattern: '^(0[1-9]|1[0-9]|2[0-4]|90)D[0-9]{2}C[0-9]{2}(_[0-9]{2})?$'
+          example: "09D01C01"
+        codigoAmie:
+          type: string
+          nullable: true
+          pattern: '^(0[1-9]|1[0-9]|2[0-4]|90)[A-Z][0-9]{5}$'
+          example: "09H00123"
+        codigoDependenciaAdmin:
+          type: string
+          nullable: true
+        cargoFuncion:
+          type: string
+          nullable: true
+        motivoAsignacion:
+          type: string
+
+    ContextAssignmentView:
+      type: object
+      required:
+        - asignacionId
+        - origenDatos
+        - esSedePrimaria
+        - nivelEstructura
+        - activo
+      properties:
+        asignacionId:
+          type: string
+          format: uuid
+        origenDatos:
+          type: string
+          enum: [GWS_PRIMARIO, PAP_DELEGADO]
+        esSedePrimaria:
+          type: boolean
+        nivelEstructura:
+          type: string
+        codigoZona:
+          type: string
+        codigoDistrito:
+          type: string
+          nullable: true
+        codigoCircuito:
+          type: string
+          nullable: true
+        codigoAmie:
+          type: string
+          nullable: true
+        codigoDependenciaAdmin:
+          type: string
+          nullable: true
+        activo:
+          type: boolean
+
+    AnomalyListResponse:
+      type: object
+      required:
+        - items
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/AnomalyItem'
+        nextCursor:
+          type: string
+          nullable: true
+
+    AnomalyItem:
+      type: object
+      required:
+        - anomaliaId
+        - googleSubId
+        - emailPrincipal
+        - dominio
+        - codigoCausal
+        - efectoAcceso
+        - estadoAnomalia
+        - detalleTecnico
+        - detectadaEn
+      properties:
+        anomaliaId:
+          type: string
+          format: uuid
+        anomaliaAnteriorId:
+          type: string
+          format: uuid
+          nullable: true
+        googleSubId:
+          type: string
+        emailPrincipal:
+          type: string
+        dominio:
+          type: string
+        codigoCausal:
+          $ref: '#/components/schemas/CodigoCausalAnomalia'
+        efectoAcceso:
+          type: string
+          enum: [BLOQUEANTE, RESTRINGIDA]
+        estadoAnomalia:
+          type: string
+          enum: [ABIERTA, EN_REVISION, LISTA_PARA_CERRAR, RESUELTA, DESCARTADA]
+        origenResolucion:
+          type: string
+          enum: [AUTO_SINCRONIZACION, MANUAL_ADMIN]
+          nullable: true
+        resueltaPorIdentificacion:
+          type: string
+          nullable: true
+        motivoResolucion:
+          type: string
+          nullable: true
+        valorAnterior:
+          type: object
+          nullable: true
+        valorNuevo:
+          type: object
+          nullable: true
+        detalleTecnico:
+          type: string
+        detectadaEn:
+          type: string
+          format: date-time
+        resueltaEn:
+          type: string
+          format: date-time
+          nullable: true
+
+    ManualResolveAnomalyRequest:
+      type: object
+      required:
+        - motivoResolucion
+      properties:
+        motivoResolucion:
+          type: string
+          minLength: 10
+          example: "Verificación documental de cédula realizada con Talento Humano y corrección confirmada en Google Workspace."
+
+    CatalogEntry:
+      type: object
+      required:
+        - categoriaAtributo
+        - codigoValor
+        - etiquetaVisible
+        - activo
+      properties:
+        categoriaAtributo:
+          $ref: '#/components/schemas/CategoriaCatalogo'
+        codigoValor:
+          type: string
+        codigoPadre:
+          type: string
+          nullable: true
+          description: Requerido para SUBTIPO_USUARIO (apunta al codigoValor en TIPO_USUARIO)
+        etiquetaVisible:
+          type: string
+        nivelAcademicoDerivado:
+          type: string
+          nullable: true
+        sinonimosOrigen:
+          type: array
+          items:
+            type: string
+          description: Sinónimos de homologación de extracciones origen del MINEDEC (FO-DNTIC-20, p.ej. "8vo año Básica" -> EGB_8)
+        requiereVigenciaTemporal:
+          type: boolean
+        activo:
+          type: boolean
+
+    CatalogEntryUpsertRequest:
+      type: object
+      required:
+        - codigoValor
+        - etiquetaVisible
+        - activo
+      properties:
+        codigoValor:
+          type: string
+        codigoPadre:
+          type: string
+          nullable: true
+        etiquetaVisible:
+          type: string
+        nivelAcademicoDerivado:
+          type: string
+          nullable: true
+        sinonimosOrigen:
+          type: array
+          items:
+            type: string
+          description: Sinónimos de homologación de extracciones origen del MINEDEC (FO-DNTIC-20)
+        requiereVigenciaTemporal:
+          type: boolean
+          default: false
+        activo:
+          type: boolean
+
+    ErrorResponse:
+      type: object
+      required:
+        - code
+        - message
+        - traceId
+      properties:
+        code:
+          type: string
+        posturaSeguridad:
+          type: string
+          enum: [FAIL_CLOSE_ACTIVO, DEGRADACION_CONTROLADA]
+        message:
+          type: string
+        diagnosticoAdministrador:
+          $ref: '#/components/schemas/AdminIncidentDiagnosticReport'
+        traceId:
+          type: string
+
+    AdminIncidentDiagnosticReport:
+      type: object
+      required:
+        - codigoIncidente
+        - severidad
+        - componenteAfectado
+        - posturaSeguridad
+        - tituloLenguajeNatural
+        - explicacionLenguajeNatural
+        - impactoOperativoYSeguridad
+        - comoSeLevantaYRecupera
+        - accionesRecomendadasAdministrador
+        - detallesTecnicosSanitizados
+      properties:
+        codigoIncidente:
+          type: string
+          enum:
+            - ALLOYDB_UNAVAILABLE_OR_FAILOVER
+            - ALLOYDB_CONNECTION_SATURATED
+            - ALLOYDB_QUERY_TIMEOUT
+            - REDIS_CACHE_UNAVAILABLE
+            - PUBSUB_BUS_DEGRADED
+            - CLOUD_TASKS_QUEUE_DEGRADED
+            - PIP_INTERNAL_UNEXPECTED_FAILURE
+        severidad:
+          type: string
+          enum: [CRITICA, ALTA, MEDIA]
+        componenteAfectado:
+          type: string
+          enum:
+            - ALLOYDB_POSTGRESQL_16
+            - MEMORYSTORE_REDIS_L2
+            - CLOUD_PUBSUB_INVALIDATION
+            - CLOUD_TASKS_SYNC
+            - PIP_IDENTITY_SERVICE
+        posturaSeguridad:
+          type: string
+          enum: [FAIL_CLOSE_ACTIVO, DEGRADACION_CONTROLADA]
+        tituloLenguajeNatural:
+          type: string
+        explicacionLenguajeNatural:
+          type: string
+        impactoOperativoYSeguridad:
+          type: string
+        comoSeLevantaYRecupera:
+          type: string
+        accionesRecomendadasAdministrador:
+          type: array
+          items:
+            type: string
+        detallesTecnicosSanitizados:
+          type: object
+          required:
+            - mensajeOriginalSanitizado
+            - timestampIso
+            - traceId
+          properties:
+            sqlState:
+              type: string
+            errorCode:
+              type: string
+            mensajeOriginalSanitizado:
+              type: string
+            timestampIso:
+              type: string
+              format: date-time
+            traceId:
+              type: string
+
+    DetailedHealthReportResponse:
+      type: object
+      required:
+        - service
+        - timestampIso
+        - traceId
+        - estadoGlobal
+        - posturaSeguridad
+        - resumenEjecutivoAdministrador
+        - componentes
+      properties:
+        service:
+          type: string
+        timestampIso:
+          type: string
+          format: date-time
+        traceId:
+          type: string
+        spanId:
+          type: string
+        estadoGlobal:
+          type: string
+          enum: [OPERATIVO, OPERATIVO_CON_CACHE_DEGRADADA, CAIDO_FAIL_CLOSE_ACTIVO]
+        posturaSeguridad:
+          type: string
+          enum: [FAIL_CLOSE_ACTIVO]
+        resumenEjecutivoAdministrador:
+          type: string
+        componentes:
+          type: object
+          properties:
+            alloydbPostgresql16:
+              type: object
+              properties:
+                estado:
+                  type: string
+                  enum: [OPERATIVO, CAIDO_O_EN_FAILOVER]
+                rolInstancia:
+                  type: string
+                  enum: [PRIMARIA_LECTURA_ESCRITURA, REPLICA_SOLO_LECTURA, DESCONOCIDO]
+                resumenLenguajeNatural:
+                  type: string
+                mecanismoRespaldoYRecuperacion:
+                  type: string
+                diagnosticoIncidente:
+                  $ref: '#/components/schemas/AdminIncidentDiagnosticReport'
+            memorystoreRedisL2:
+              type: object
+              properties:
+                estado:
+                  type: string
+                  enum: [OPERATIVO, DEGRADADO]
+                ttlMaximoSegundos:
+                  type: integer
+                resumenLenguajeNatural:
+                  type: string
+

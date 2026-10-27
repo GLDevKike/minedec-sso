@@ -1,0 +1,877 @@
+openapi: 3.1.0
+info:
+  title: Conecta MINEDEC (C2.2) — API del Sincronizador de Identidades en Solo Lectura y Conciliación Masiva (Google Workspace -> PIP)
+  version: 1.0.0
+  description: |
+    Contrato OpenAPI 3.1 de los servicios de sincronización y conciliación de la feature `002-sincronizador-conciliacion-gws`:
+    1. **Ingesta Push y Despacho Regulado de Eventos de Directorio (`<= 28 req/s` = 70 % de cuota)**:
+       - Recepción de notificaciones push de Cloud Pub/Sub (`POST /internal/v1/sync/events/pubsub-push`) con deduplicación por `idEventoExterno`.
+       - Worker prioritario de `REGISTRO_CALIENTE` (`POST /internal/v1/sync/tasks/priority-hot-registration`, reserva garantizada de `<= 5 req/s`, SLA `< 10 s` p95).
+       - Worker incremental con conmutación automática a modo lote por histéresis (`POST /internal/v1/sync/tasks/incremental`, `>= 100` pendientes o `> 10 s` activa `users.list` de 500 cuentas; `< 20` restaura `users.get`).
+       - Barrido delta periódico cada 2 minutos (`POST /internal/v1/sync/tasks/delta-sweep`).
+    2. **Gobernanza de Conciliación Masiva (`CheckpointConciliacion`), Baja Lógica en Dos Niveles y Bandeja `DLQ`**:
+       - Consulta y reanudación de particiones `(dominio, orgUnitPath, tipoProceso)` con exclusión mutua (`pg_try_advisory_lock`) y recuperación automática por expiración de latido (`heartbeat > 15 min`).
+       - Inspección de la bandeja `DLQ` (`GET /api/v1/admin/sync/dlq`) con diagnósticos en lenguaje natural en español y reprocesamiento controlado con validación de obsolescencia (`POST /api/v1/admin/sync/dlq/replay`).
+       - Desactivación de usuario raíz (`PersonaIdentidad`) con propagación a todas sus cuentas institucionales e invalidación de caché L2 en `< 5 s` (`POST /api/v1/admin/sync/persons/{idInterno}/deactivate`).
+servers:
+  - url: https://sync-internal.conecta.educacion.gob.ec
+    description: Servicio Cloud Run Interno del Sincronizador (INGRESS_TRAFFIC_INTERNAL_ONLY)
+
+security:
+  - InternalServiceJwt: []
+
+paths:
+  /internal/v1/sync/events/pubsub-push:
+    post:
+      operationId: receiveDirectoryAuditPubSubPush
+      summary: Recibe eventos push de Cloud Pub/Sub (Google Workspace Admin Audit Logs), deduplica por idEventoExterno y encola en Cloud Tasks respetando el techo de 28 req/s
+      tags:
+        - Sync Internal (Pub/Sub Ingress)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/PubSubPushEnvelope'
+      responses:
+        '200':
+          description: Evento deduplicado y encolado (o descartado por duplicidad/obsolescencia de forma idempotente)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PubSubIngressAckResponse'
+        '400':
+          description: Sobre Pub/Sub malformado (se registra diagnóstico y se deriva a DLQ si corresponde)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /internal/v1/sync/tasks/priority-hot-registration:
+    post:
+      operationId: processPriorityHotRegistrationTask
+      summary: Procesa en carril prioritario reservado (<= 5 req/s) la reconciliación de una cuenta provisional en REGISTRO_CALIENTE (< 10 s p95)
+      tags:
+        - Sync Internal (Cloud Tasks Workers)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/PriorityHotRegistrationTaskPayload'
+      responses:
+        '200':
+          description: Identidad provisional reconciliada (promovida a ACTIVA, re-vinculada a PersonaIdentidad existente o bloqueada por anomalía con purga de caché < 5 s)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SyncTaskExecutionResponse'
+        '429':
+          description: Cuota en retroceso exponencial con jitter (Cloud Tasks reintentará según Retry-After hasta 5 intentos antes de derivar a DLQ)
+          headers:
+            Retry-After:
+              schema:
+                type: integer
+              description: Segundos de espera antes del siguiente reintento
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /internal/v1/sync/tasks/incremental:
+    post:
+      operationId: processIncrementalDirectorySyncTask
+      summary: Procesa eventos incrementales de directorio aplicando conmutación automática por histéresis (INDIVIDUAL_GET vs LOTE_LIST_500) y baja lógica diferenciada en dos niveles
+      tags:
+        - Sync Internal (Cloud Tasks Workers)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/IncrementalSyncTaskPayload'
+      responses:
+        '200':
+          description: Evento procesado (o lote de hasta 500 cuentas hidratado), persistido en AlloyDB e invalidado en Redis L2 (< 5 s)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SyncTaskExecutionResponse'
+        '429':
+          description: Límite de cuota o fallo transitorio en retroceso exponencial (máximo 5 intentos antes de derivar a DLQ)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /internal/v1/sync/tasks/delta-sweep:
+    post:
+      operationId: executeTwoMinuteDeltaSweep
+      summary: Ejecuta el barrido incremental delta cada 2 minutos (con solapamiento de 30 s) para capturar cambios demorados en el pipeline de auditoría de Google Workspace
+      tags:
+        - Sync Internal (Cloud Scheduler & Workers)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/DeltaSweepRequest'
+      responses:
+        '200':
+          description: Barrido delta ejecutado dentro del presupuesto de cuota (<= 28 req/s)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DeltaSweepResponse'
+
+  /api/v1/admin/sync/checkpoints:
+    get:
+      operationId: listReconciliationCheckpoints
+      summary: Lista el estado de las particiones de carga inicial y conciliación masiva (CheckpointConciliacion), incluyendo detección de particiones huérfanas y diagnóstico en español
+      tags:
+        - PAP Admin (Reconciliation & Checkpoints)
+      parameters:
+        - name: dominio
+          in: query
+          required: false
+          schema:
+            type: string
+        - name: tipoProceso
+          in: query
+          required: false
+          schema:
+            $ref: '#/components/schemas/TipoProcesoConciliacion'
+        - name: estadoEjecucion
+          in: query
+          required: false
+          schema:
+            $ref: '#/components/schemas/EstadoEjecucionCheckpoint'
+      responses:
+        '200':
+          description: Lista de puntos de control por partición y resumen global de avance
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CheckpointListResponse'
+
+  /api/v1/admin/sync/partitions/trigger:
+    post:
+      operationId: triggerOrResumePartitionReconciliation
+      summary: Inicia o reanuda una partición de conciliación (reclamando particiones huérfanas con heartbeat > 15 min mediante pg_try_advisory_lock desde el último nextPageToken)
+      tags:
+        - PAP Admin (Reconciliation & Checkpoints)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/TriggerPartitionRequest'
+      responses:
+        '200':
+          description: Partición reclamada y procesada (o página/lote ejecutado) exitosamente
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PartitionExecutionSummary'
+        '409':
+          description: La partición ya se encuentra en progreso activo por otro worker con latido vigente (<= 15 minutos)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /api/v1/admin/sync/dlq:
+    get:
+      operationId: listSyncDeadLetterQueue
+      summary: Consulta paginada de eventos en la bandeja DLQ (registro_fallo_sincronizacion) con diagnósticos en lenguaje natural y acciones recomendadas
+      tags:
+        - PAP Admin (DLQ & Resilience)
+      parameters:
+        - name: estadoDlq
+          in: query
+          required: false
+          schema:
+            $ref: '#/components/schemas/EstadoRegistroDlq'
+        - name: dominio
+          in: query
+          required: false
+          schema:
+            type: string
+        - name: limit
+          in: query
+          required: false
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 100
+            default: 50
+      responses:
+        '200':
+          description: Registros de la bandeja DLQ con diagnóstico operativo en español
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DlqListResponse'
+
+  /api/v1/admin/sync/dlq/replay:
+    post:
+      operationId: replayDeadLetterQueueEvents
+      summary: Reprocesa de forma controlada eventos de la DLQ a través del canal regulado (<= 28 req/s) con protección contra escrituras obsoletas (RESUELTO_POR_OBSOLESCENCIA)
+      tags:
+        - PAP Admin (DLQ & Resilience)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ReplayDlqRequest'
+      responses:
+        '200':
+          description: Resultado del reprocesamiento regulado (reprocesados en vivo vs descartados por obsolescencia)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ReplayDlqResponse'
+
+  /api/v1/admin/sync/persons/{idInterno}/deactivate:
+    post:
+      operationId: deactivatePersonAndAllAccounts
+      summary: Desactiva o bloquea a nivel de PersonaIdentidad (usuario raíz), propagando la baja lógica a todas sus CuentaInstitucional en todos los subdominios e invalidando Redis en < 5 s
+      tags:
+        - PAP Admin (Two-Level Logical Deactivation)
+      parameters:
+        - name: idInterno
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/DeactivatePersonRequest'
+      responses:
+        '200':
+          description: PersonaIdentidad y todas sus cuentas institucionales desactivadas e invalidadas en caché L2 (< 5 s)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DeactivatePersonResponse'
+        '404':
+          description: PersonaIdentidad no encontrada
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /internal/v1/sync/health/detailed:
+    get:
+      operationId: getSyncDetailedHealthAndQuotaStatus
+      summary: Devuelve el estado detallado del Sincronizador, presupuesto de cuota en tiempo real (<= 28 req/s), estado de histéresis de modo lote y diagnóstico en lenguaje natural
+      tags:
+        - Sync Internal (Observability & Diagnostics)
+      responses:
+        '200':
+          description: Estado operativo saludable o en modo lote regulado
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SyncDetailedHealthResponse'
+        '503':
+          description: Degradación crítica con reporte de diagnóstico en lenguaje natural y postura FAIL_CLOSE_ACTIVO
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SyncDetailedHealthResponse'
+
+components:
+  securitySchemes:
+    InternalServiceJwt:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: Token OIDC/JWT de cuenta de servicio interna (sa-sync, sa-sync-job, sa-conecta) o sesión administrativa IAP validada.
+
+  schemas:
+    TipoEventoDirectorio:
+      type: string
+      enum:
+        - CREATE_USER
+        - CHANGE_USER
+        - SUSPEND_USER
+        - UNSUSPEND_USER
+        - DELETE_USER
+        - REGISTRO_CALIENTE_RECONCILE
+        - BARRIDO_DELTA_2MIN
+
+    ModoDespachoSincronizacion:
+      type: string
+      enum:
+        - INDIVIDUAL_GET
+        - LOTE_LIST_500
+        - OMITIDO_DUPLICADO
+        - OMITIDO_OBSOLETO
+
+    TipoProcesoConciliacion:
+      type: string
+      enum:
+        - CARGA_INICIAL
+        - CONCILIACION_DIARIA
+        - BARRIDO_DELTA
+
+    EstadoEjecucionCheckpoint:
+      type: string
+      enum:
+        - PENDIENTE
+        - EN_PROGRESO
+        - PAUSADO_CUOTA
+        - COMPLETADO
+        - FALLIDO
+
+    EstadoRegistroDlq:
+      type: string
+      enum:
+        - PENDIENTE_REVISION
+        - EN_REPROCESAMIENTO
+        - RESUELTO_REPROCESADO
+        - RESUELTO_POR_OBSOLESCENCIA
+        - DESCARTADO_MANUAL
+
+    PubSubPushEnvelope:
+      type: object
+      required:
+        - message
+      properties:
+        subscription:
+          type: string
+        message:
+          type: object
+          required:
+            - data
+            - messageId
+          properties:
+            messageId:
+              type: string
+            publishTime:
+              type: string
+              format: date-time
+            data:
+              type: string
+              description: Payload JSON codificado en Base64 del evento de Google Workspace Admin Audit Log
+            attributes:
+              type: object
+              additionalProperties:
+                type: string
+
+    PubSubIngressAckResponse:
+      type: object
+      required:
+        - idEventoExterno
+        - status
+        - modoDespachoActual
+      properties:
+        idEventoExterno:
+          type: string
+        status:
+          type: string
+          enum:
+            - ENQUEUED_INCREMENTAL
+            - ENQUEUED_PRIORITY_HOT_REG
+            - IGNORED_DUPLICATE
+            - IGNORED_OBSOLETE
+        modoDespachoActual:
+          $ref: '#/components/schemas/ModoDespachoSincronizacion'
+        colaPendientesEstimada:
+          type: integer
+
+    PriorityHotRegistrationTaskPayload:
+      type: object
+      required:
+        - idEventoExterno
+        - googleSubId
+        - emailPrincipal
+        - dominio
+      properties:
+        idEventoExterno:
+          type: string
+        googleSubId:
+          type: string
+        emailPrincipal:
+          type: string
+          format: email
+        dominio:
+          type: string
+        solicitadoEn:
+          type: string
+          format: date-time
+
+    IncrementalSyncTaskPayload:
+      type: object
+      required:
+        - idEventoExterno
+        - tipoEvento
+        - timestampEventoGws
+      properties:
+        idEventoExterno:
+          type: string
+        tipoEvento:
+          $ref: '#/components/schemas/TipoEventoDirectorio'
+        googleSubId:
+          type: string
+        emailPrincipal:
+          type: string
+          format: email
+        dominio:
+          type: string
+        orgUnitPath:
+          type: string
+        timestampEventoGws:
+          type: string
+          format: date-time
+        colaPendientesAlDespachar:
+          type: integer
+          minimum: 0
+        antiguedadMensajeMasViejoSegundos:
+          type: number
+          minimum: 0
+        intentoActual:
+          type: integer
+          minimum: 1
+          maximum: 5
+          default: 1
+
+    SyncTaskExecutionResponse:
+      type: object
+      required:
+        - idEventoExterno
+        - resultado
+        - modoDespacho
+        - cacheInvalidated
+      properties:
+        idEventoExterno:
+          type: string
+        resultado:
+          type: string
+          enum:
+            - APLICADO
+            - SIN_CAMBIOS_HASH
+            - ANOMALIA_REGISTRADA
+            - DUPLICADO_IGNORADO
+            - OBSOLETO_IGNORADO
+            - DERIVADO_A_DLQ
+        modoDespacho:
+          $ref: '#/components/schemas/ModoDespachoSincronizacion'
+        cuentasProcesadasEnLote:
+          type: integer
+          default: 1
+        estadoPersonaResultante:
+          type: string
+        estadoCuentaResultante:
+          type: string
+        cacheInvalidated:
+          type: boolean
+
+    DeltaSweepRequest:
+      type: object
+      properties:
+        ventanaMinutos:
+          type: integer
+          default: 2
+        solapamientoSegundos:
+          type: integer
+          default: 30
+        dominios:
+          type: array
+          items:
+            type: string
+
+    DeltaSweepResponse:
+      type: object
+      required:
+        - dominiosBarridos
+        - cuentasEvaluadas
+        - cuentasActualizadas
+        - cuentasOmitidasHash
+      properties:
+        dominiosBarridos:
+          type: array
+          items:
+            type: string
+        cuentasEvaluadas:
+          type: integer
+        cuentasActualizadas:
+          type: integer
+        cuentasOmitidasHash:
+          type: integer
+
+    CheckpointView:
+      type: object
+      required:
+        - checkpointId
+        - dominio
+        - orgUnitPath
+        - tipoProceso
+        - estadoEjecucion
+        - cuentasProcesadas
+        - cuentasActualizadas
+        - cuentasOmitidasHash
+        - cuentasBajaDetectadas
+        - heartbeatEn
+        - esParticionHuerfana
+      properties:
+        checkpointId:
+          type: string
+          format: uuid
+        dominio:
+          type: string
+        orgUnitPath:
+          type: string
+        tipoProceso:
+          $ref: '#/components/schemas/TipoProcesoConciliacion'
+        nextPageToken:
+          type:
+            - string
+            - 'null'
+        cuentasProcesadas:
+          type: integer
+        cuentasActualizadas:
+          type: integer
+        cuentasOmitidasHash:
+          type: integer
+        cuentasBajaDetectadas:
+          type: integer
+        anomaliasAbiertas:
+          type: integer
+        estadoEjecucion:
+          $ref: '#/components/schemas/EstadoEjecucionCheckpoint'
+        workerInstanciaId:
+          type:
+            - string
+            - 'null'
+        heartbeatEn:
+          type: string
+          format: date-time
+        esParticionHuerfana:
+          type: boolean
+          description: true si estadoEjecucion es EN_PROGRESO y han transcurrido > 15 minutos desde heartbeatEn
+        diagnosticoOperativo:
+          type:
+            - string
+            - 'null'
+
+    CheckpointListResponse:
+      type: object
+      required:
+        - totalParticiones
+        - particionesHuerfanasDetectadas
+        - items
+      properties:
+        totalParticiones:
+          type: integer
+        particionesHuerfanasDetectadas:
+          type: integer
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/CheckpointView'
+
+    TriggerPartitionRequest:
+      type: object
+      required:
+        - dominio
+        - orgUnitPath
+        - tipoProceso
+      properties:
+        dominio:
+          type: string
+        orgUnitPath:
+          type: string
+          default: '/'
+        tipoProceso:
+          $ref: '#/components/schemas/TipoProcesoConciliacion'
+        workerInstanciaId:
+          type: string
+        maxPaginasPorEjecucion:
+          type: integer
+          minimum: 1
+          maximum: 5000
+          default: 100
+        confirmarBajasPorAusenciaAlCompletar:
+          type: boolean
+          default: true
+
+    PartitionExecutionSummary:
+      type: object
+      required:
+        - checkpoint
+        - reclamoParticionHuerfana
+        - paginasProcesadasEnCiclo
+        - diagnosticoLenguajeNatural
+      properties:
+        checkpoint:
+          $ref: '#/components/schemas/CheckpointView'
+        reclamoParticionHuerfana:
+          type: boolean
+        tokenReanudadoDesde:
+          type:
+            - string
+            - 'null'
+        paginasProcesadasEnCiclo:
+          type: integer
+        diagnosticoLenguajeNatural:
+          type: string
+
+    DlqRecordView:
+      type: object
+      required:
+        - dlqId
+        - idEventoExterno
+        - tipoEvento
+        - timestampEventoGws
+        - intentosRealizados
+        - codigoError
+        - diagnosticoLenguajeNatural
+        - accionRecomendada
+        - estadoDlq
+        - creadoEn
+      properties:
+        dlqId:
+          type: string
+          format: uuid
+        idEventoExterno:
+          type: string
+        tipoEvento:
+          type: string
+        googleSubId:
+          type:
+            - string
+            - 'null'
+        emailPrincipal:
+          type:
+            - string
+            - 'null'
+        dominio:
+          type:
+            - string
+            - 'null'
+        timestampEventoGws:
+          type: string
+          format: date-time
+        intentosRealizados:
+          type: integer
+        codigoError:
+          type: string
+        detalleErrorTecnico:
+          type: string
+        diagnosticoLenguajeNatural:
+          type: string
+        accionRecomendada:
+          type: string
+        estadoDlq:
+          $ref: '#/components/schemas/EstadoRegistroDlq'
+        creadoEn:
+          type: string
+          format: date-time
+        resueltoEn:
+          type:
+            - string
+            - 'null'
+
+    DlqListResponse:
+      type: object
+      required:
+        - totalPendientes
+        - items
+      properties:
+        totalPendientes:
+          type: integer
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/DlqRecordView'
+
+    ReplayDlqRequest:
+      type: object
+      required:
+        - adminIdentificacion
+        - motivoReplay
+      properties:
+        dlqIds:
+          type: array
+          items:
+            type: string
+            format: uuid
+          description: Lista de IDs específicos a reprocesar (si se omite, toma hasta maxRegistros en PENDIENTE_REVISION)
+        dominio:
+          type: string
+        maxRegistros:
+          type: integer
+          minimum: 1
+          maximum: 500
+          default: 50
+        adminIdentificacion:
+          type: string
+        motivoReplay:
+          type: string
+
+    ReplayDlqResponse:
+      type: object
+      required:
+        - totalEvaluados
+        - totalReprocesadosExitosos
+        - totalResueltosPorObsolescencia
+        - totalFallidosNuevamente
+        - resumenLenguajeNatural
+      properties:
+        totalEvaluados:
+          type: integer
+        totalReprocesadosExitosos:
+          type: integer
+        totalResueltosPorObsolescencia:
+          type: integer
+        totalFallidosNuevamente:
+          type: integer
+        resumenLenguajeNatural:
+          type: string
+
+    DeactivatePersonRequest:
+      type: object
+      required:
+        - adminIdentificacion
+        - motivoDesactivacion
+      properties:
+        nuevoEstadoPersona:
+          type: string
+          enum:
+            - INACTIVA
+            - BLOQUEADA_ANOMALIA
+          default: INACTIVA
+        adminIdentificacion:
+          type: string
+        motivoDesactivacion:
+          type: string
+
+    DeactivatePersonResponse:
+      type: object
+      required:
+        - idInterno
+        - estadoPersona
+        - cuentasDesactivadasCount
+        - subdominiosAfectados
+        - cacheInvalidated
+      properties:
+        idInterno:
+          type: string
+          format: uuid
+        estadoPersona:
+          type: string
+        cuentasDesactivadasCount:
+          type: integer
+        subdominiosAfectados:
+          type: array
+          items:
+            type: string
+        cacheInvalidated:
+          type: boolean
+
+    SyncDetailedHealthResponse:
+      type: object
+      required:
+        - status
+        - quotaBudget
+        - batchSwitchHysteresis
+        - diagnosticoAdministrador
+      properties:
+        status:
+          type: string
+          enum:
+            - HEALTHY
+            - DEGRADED_BATCH_MODE
+            - CRITICAL_FAIL_CLOSE
+        quotaBudget:
+          type: object
+          required:
+            - googleOfficialLimitRps
+            - minedecHardCeilingRps
+            - batchJobActive
+            - priorityHotRegReservedRps
+            - incrementalAllocatedRps
+            - batchJobAllocatedRps
+            - currentGlobalUsedRps
+          properties:
+            googleOfficialLimitRps:
+              type: integer
+              example: 40
+            minedecHardCeilingRps:
+              type: integer
+              example: 28
+            batchJobActive:
+              type: boolean
+            priorityHotRegReservedRps:
+              type: integer
+              example: 5
+            incrementalAllocatedRps:
+              type: integer
+              example: 23
+            batchJobAllocatedRps:
+              type: integer
+              example: 20
+            currentGlobalUsedRps:
+              type: number
+        batchSwitchHysteresis:
+          type: object
+          required:
+            - currentMode
+            - highWatermarkPendingEvents
+            - highWatermarkMaxAgeSeconds
+            - lowWatermarkRestoreEvents
+          properties:
+            currentMode:
+              $ref: '#/components/schemas/ModoDespachoSincronizacion'
+            highWatermarkPendingEvents:
+              type: integer
+              example: 100
+            highWatermarkMaxAgeSeconds:
+              type: integer
+              example: 10
+            lowWatermarkRestoreEvents:
+              type: integer
+              example: 20
+        diagnosticoAdministrador:
+          type: object
+          required:
+            - tituloLenguajeNatural
+            - explicacionLenguajeNatural
+            - posturaSeguridad
+            - pasosRecomendados
+          properties:
+            tituloLenguajeNatural:
+              type: string
+            explicacionLenguajeNatural:
+              type: string
+            posturaSeguridad:
+              type: string
+              enum:
+                - FAIL_CLOSE_ACTIVO
+                - OPERACION_NOMINAL
+            pasosRecomendados:
+              type: array
+              items:
+                type: string
+
+    ErrorResponse:
+      type: object
+      required:
+        - code
+        - message
+      properties:
+        code:
+          type: string
+        message:
+          type: string
+        diagnosticoLenguajeNatural:
+          type: string
+        accionRecomendada:
+          type: string

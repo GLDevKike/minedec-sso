@@ -1,0 +1,819 @@
+openapi: 3.1.0
+info:
+  title: Conecta MINEDEC (C2.2) — Servicio Intermediario OIDC Central (sso-oidc, DA-11)
+  version: 1.0.0
+  description: |
+    Contrato OpenAPI 3.1.0 para la **Feature 003 (`003-sso-oidc-intermediario`)**:
+    1. **Servicio Intermediario OIDC Central (`backend/sso-oidc` en GKE Autopilot — `https://login.sso.<dominio>`)**:
+       - Publicado detrás del External Application Load Balancer + Google Cloud Armor WAF (**sin Cloud IAP delante**, `DA-11`).
+       - Actúa como **único cliente OAuth 2.0** registrado ante Google Cloud Identity (`https://accounts.google.com`, `D-01`) y como **OpenID Provider (OP)** certificado (`oidc-provider`) frente a todas las aplicaciones institucionales (Patrón 1 SP/RP Nativo y PEP del Patrón 2 Perimetral).
+       - Gestiona `client_id` y `redirect_uris` en 1FN/3FN en AlloyDB sin el límite de 100 URIs de GCP (`SC-002`).
+       - Exige `Authorization Code + PKCE (S256)` obligatorio, mantiene sesión central y códigos de uso único (`<= 60 s`) en Memorystore for Redis con revalidación obligatoria cada `<= 300 s` (`RF-GI-06`, `RF-AUT-06`, `PI-07`), ejecuta espera corta local acotada (`<= 3 s`) en `REGISTRO_CALIENTE` con postura `fail-close` (`Clarificación Q1`), propaga el cierre de sesión único mediante SLO híbrido de dos capas (`OIDC Back-Channel Logout` + expiración `<= 300 s`, `Clarificación Q2`) y emite `id_token` firmados con `RS256` (`servicio_emisor = 'SSO_OIDC'`, `Clarificación Q3`) con `aud` exclusivo por aplicación y **cero reclamos de roles o permisos**.
+       - **Cero telemetría de latencia en respuestas HTTP (`RNF-REN-01..06`, `D-06`, Principio V.4, Principio XIII)**: ninguna respuesta incluye campos de duración calculados en Node.js.
+  contact:
+    name: Arquitectura e Ingeniería de Seguridad — Conecta MINEDEC (C2.2)
+
+servers:
+  - url: https://login.sso.educacion.gob.ec
+    description: Endpoint público del Broker OIDC Central (External ALB + Cloud Armor WAF)
+  - url: http://sso-oidc.conecta-minedec.svc.cluster.local:8080
+    description: Endpoint interno en GKE Autopilot (eventos Pub/Sub y sondas de salud)
+
+tags:
+  - name: OIDC Discovery & JWKS
+    description: Descubrimiento estándar OpenID Connect 1.0 y claves públicas RS256 (SSO_OIDC)
+  - name: OIDC Authorization & Federation
+    description: Inicio de autorización PKCE S256, federación con Google Cloud Identity y sesión SSO central
+  - name: OIDC Token Endpoint
+    description: Canje de código de uso único (<= 60 s) y emisión de id_token RS256 por aplicación sin roles
+  - name: OIDC Single Logout (SLO)
+    description: Cierre de sesión único híbrido (purga en Redis + OIDC Back-Channel Logout + redirección)
+  - name: Internal Revocation & Key Management
+    description: Suscripción interna Pub/Sub para invalidación inmediata (< 5 s) y rotación/revocación JWKS
+  - name: Health & Readiness
+    description: Sondas de salud para GKE Autopilot y External Application Load Balancer
+
+paths:
+  /.well-known/openid-configuration:
+    get:
+      tags: [OIDC Discovery & JWKS]
+      operationId: getOpenIdConfiguration
+      summary: Documento de descubrimiento OpenID Connect 1.0 (FR-001)
+      responses:
+        '200':
+          description: Metadatos del emisor OIDC central Conecta MINEDEC
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/OpenIdConfigurationDocument'
+
+  /jwks:
+    get:
+      tags: [OIDC Discovery & JWKS]
+      operationId: getJwks
+      summary: Conjunto de claves públicas JWK RS256 activas y en ventana de gracia de sso-oidc (FR-013, SC-005)
+      description: |
+        Expone exclusivamente las claves públicas con `servicio_emisor = 'SSO_OIDC'` y `estado_llave IN ('ACTIVA_FIRMA', 'GRACIA_VERIFICACION')`. Las llaves en estado `RETIRADA` o `REVOCADA` y las llaves de `MOTOR_PDP` nunca se exponen en este endpoint.
+      responses:
+        '200':
+          description: JWK Set público RS256
+          headers:
+            Cache-Control:
+              schema:
+                type: string
+                example: public, max-age=300, must-revalidate
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/JwksDocument'
+
+  /authorize:
+    get:
+      tags: [OIDC Authorization & Federation]
+      operationId: authorizeOidcRequest
+      summary: Endpoint de autorización OIDC con validación estricta de client_id, redirect_uri 1FN y PKCE S256 (FR-002, FR-003, FR-006)
+      parameters:
+        - name: response_type
+          in: query
+          required: true
+          schema:
+            type: string
+            enum: [code]
+        - name: client_id
+          in: query
+          required: true
+          schema:
+            type: string
+            minLength: 3
+            maxLength: 128
+        - name: redirect_uri
+          in: query
+          required: true
+          schema:
+            type: string
+            format: uri
+        - name: scope
+          in: query
+          required: true
+          schema:
+            type: string
+            example: openid profile email
+        - name: state
+          in: query
+          required: true
+          schema:
+            type: string
+            minLength: 8
+            maxLength: 512
+        - name: nonce
+          in: query
+          required: false
+          schema:
+            type: string
+            minLength: 8
+            maxLength: 512
+        - name: code_challenge
+          in: query
+          required: true
+          schema:
+            type: string
+            minLength: 43
+            maxLength: 128
+        - name: code_challenge_method
+          in: query
+          required: true
+          schema:
+            type: string
+            enum: [S256]
+        - name: prompt
+          in: query
+          required: false
+          schema:
+            type: string
+            enum: [none, login, consent, select_account]
+        - name: hd
+          in: query
+          required: false
+          description: Sugerencia opcional de subdominio institucional (@educacion.gob.ec, @estudiantes.educacion.gob.ec, @deporte.gob.ec, @cultura.gob.ec)
+          schema:
+            type: string
+      responses:
+        '302':
+          description: |
+            - Si existe sesión SSO activa en Redis revalidada contra el PIP en `<= 300 s`: redirige directamente al `redirect_uri` de la aplicación con `?code=...&state=...` (SSO silencioso).
+            - Si no existe sesión SSO activa: redirige al endpoint de autorización de Google Cloud Identity (`https://accounts.google.com/o/oauth2/v2/auth`) usando el único cliente OAuth de `sso-oidc`.
+            - Si el error OIDC ocurre con `client_id` y `redirect_uri` válidos (ej. falta PKCE S256): redirige al `redirect_uri` con `?error=invalid_request&error_description=...&state=...`.
+          headers:
+            Location:
+              schema:
+                type: string
+                format: uri
+        '400':
+          description: Cliente OIDC inexistente/revocado o `redirect_uri` no registrada (prohibido redirigir a URI no confiable, FR-002)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/OidcSecurityErrorResponse'
+
+  /callback:
+    get:
+      tags: [OIDC Authorization & Federation]
+      operationId: handleGoogleIdpCallback
+      summary: Callback del único cliente OAuth 2.0 ante Google Cloud Identity, resolución PIP y espera corta (<= 3 s) en REGISTRO_CALIENTE (FR-004, FR-005, FR-007)
+      parameters:
+        - name: code
+          in: query
+          required: false
+          schema:
+            type: string
+        - name: state
+          in: query
+          required: true
+          schema:
+            type: string
+        - name: error
+          in: query
+          required: false
+          schema:
+            type: string
+      responses:
+        '302':
+          description: |
+            Identidad verificada en Google Cloud Identity (dominio `hd` institucional válido), consolidada en el PIP con `(tipo_identificacion, numero_identificacion)` e `id_interno`, sesión central creada en Redis y redirección hacia el `redirect_uri` de la aplicación solicitante con el `code` OIDC efímero (`TTL <= 60 s`).
+          headers:
+            Location:
+              schema:
+                type: string
+                format: uri
+            Set-Cookie:
+              description: Cookie de sesión central SSO (`HttpOnly; Secure; SameSite=Lax`)
+              schema:
+                type: string
+        '403':
+          description: |
+            Acceso denegado (`fail-close`):
+            - Cuenta fuera de los subdominios institucionales autorizados (`FR-005`).
+            - Cuenta en estado `SUSPENDIDA_GWS`, `ELIMINADA_GWS`, `INACTIVA` o `BLOQUEADA_ANOMALIA` (`FR-010`).
+            - Cuenta nueva en `REGISTRO_CALIENTE` que tras la espera corta local acotada (`<= 3 s`) continúa en `PENDIENTE_IDENTIFICACION` sin `numero_identificacion` consolidado (`FR-007`, `Clarificación Q1`).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/OidcSecurityErrorResponse'
+
+  /token:
+    post:
+      tags: [OIDC Token Endpoint]
+      operationId: exchangeAuthorizationCodeForTokens
+      summary: Canje de código de uso único (<= 60 s) con verificación PKCE S256 y emisión de id_token RS256 exclusivo por aplicación sin roles (FR-003, FR-008, FR-009, FR-012)
+      security:
+        - ClientSecretBasic: []
+        - {}
+      requestBody:
+        required: true
+        content:
+          application/x-www-form-urlencoded:
+            schema:
+              $ref: '#/components/schemas/TokenExchangeRequest'
+      responses:
+        '200':
+          description: Emisión exitosa de `id_token` firmado con RS256 (`aud = client_id`, sin roles) y `access_token`
+          headers:
+            Cache-Control:
+              schema:
+                type: string
+                example: no-store
+            Pragma:
+              schema:
+                type: string
+                example: no-cache
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TokenExchangeResponse'
+        '400':
+          description: Código expirado (> 60 s), código reutilizado (replay bloqueado), `code_verifier` PKCE inválido o `redirect_uri` discrepante (`invalid_grant` / `invalid_request`)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/OAuthTokenErrorResponse'
+        '401':
+          description: Fallo de autenticación de cliente confidencial (`invalid_client`)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/OAuthTokenErrorResponse'
+
+  /logout:
+    get:
+      tags: [OIDC Single Logout (SLO)]
+      operationId: rpInitiatedLogoutGet
+      summary: Cierre de Sesión Único (SLO) vía GET con purga inmediata en Redis y despacho asíncrono de Back-Channel Logout (FR-011, Clarificación Q2)
+      parameters:
+        - name: id_token_hint
+          in: query
+          required: false
+          schema:
+            type: string
+        - name: client_id
+          in: query
+          required: false
+          schema:
+            type: string
+        - name: post_logout_redirect_uri
+          in: query
+          required: false
+          schema:
+            type: string
+            format: uri
+        - name: state
+          in: query
+          required: false
+          schema:
+            type: string
+      responses:
+        '302':
+          description: Sesión central destruida en Redis, `logout_token` despachados asíncronamente a URIs `BACKCHANNEL_LOGOUT` y redirección al `post_logout_redirect_uri` validado
+          headers:
+            Location:
+              schema:
+                type: string
+                format: uri
+        '200':
+          description: Sesión central destruida cuando no se especificó `post_logout_redirect_uri`
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/LogoutCompletedResponse'
+        '400':
+          description: `post_logout_redirect_uri` no registrado para el cliente OIDC
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/OidcSecurityErrorResponse'
+    post:
+      tags: [OIDC Single Logout (SLO)]
+      operationId: rpInitiatedLogoutPost
+      summary: Cierre de Sesión Único (SLO) vía POST (FR-011, Clarificación Q2)
+      requestBody:
+        required: false
+        content:
+          application/x-www-form-urlencoded:
+            schema:
+              $ref: '#/components/schemas/LogoutRequestForm'
+          application/json:
+            schema:
+              $ref: '#/components/schemas/LogoutRequestForm'
+      responses:
+        '200':
+          description: Sesión central destruida y notificaciones Back-Channel Logout despachadas
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/LogoutCompletedResponse'
+        '302':
+          description: Redirección al `post_logout_redirect_uri` autorizado
+        '400':
+          description: `post_logout_redirect_uri` no autorizado
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/OidcSecurityErrorResponse'
+
+  /internal/v1/oidc/events/identity-revoked:
+    post:
+      tags: [Internal Revocation & Key Management]
+      operationId: handleIdentityRevocationEvent
+      summary: Receptor interno Pub/Sub para purgar sesiones OIDC centrales y códigos efímeros en < 5 s (FR-010, SC-004)
+      description: |
+        Invocado ante eventos de suspensión/baja de `CuentaInstitucional` (purga selectiva de esa cuenta) o desactivación de `PersonaIdentidad` (purga global en cascada de todas sus cuentas + despacho de Back-Channel Logout).
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/IdentityRevocationEventPayload'
+      responses:
+        '200':
+          description: Sesiones y códigos efímeros invalidados en Redis
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/IdentityRevocationAckResponse'
+
+  /internal/v1/oidc/jwks/rotate:
+    post:
+      tags: [Internal Revocation & Key Management]
+      operationId: rotateSsoOidcJwksKey
+      summary: Activa una nueva llave RS256 para SSO_OIDC y pasa la llave previa a GRACIA_VERIFICACION (FR-013, SC-005)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RotateJwksKeyRequest'
+      responses:
+        '200':
+          description: Rotación dual ejecutada sin interrupción de sesiones en vuelo
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RotateJwksKeyResponse'
+
+  /internal/v1/oidc/jwks/{kid}/revoke:
+    post:
+      tags: [Internal Revocation & Key Management]
+      operationId: revokeSsoOidcJwksKey
+      summary: Revocación inmediata de emergencia (< 1 h) de una llave RS256 comprometida o retirada (FR-013, SC-005)
+      parameters:
+        - name: kid
+          in: path
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RevokeJwksKeyRequest'
+      responses:
+        '200':
+          description: Llave marcada como REVOCADA o RETIRADA y eliminada inmediatamente de GET /jwks
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RotateJwksKeyResponse'
+
+  /healthz:
+    get:
+      tags: [Health & Readiness]
+      operationId: getLiveness
+      summary: Sonda de vivacidad (Liveness Probe) en GKE Autopilot
+      responses:
+        '200':
+          description: Proceso sso-oidc activo
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [status, service]
+                properties:
+                  status:
+                    type: string
+                    enum: [UP]
+                  service:
+                    type: string
+                    example: conecta-sso-oidc
+
+  /readyz:
+    get:
+      tags: [Health & Readiness]
+      operationId: getReadiness
+      summary: Sonda de disponibilidad (Readiness Probe) verificando AlloyDB, Redis y llave activa RS256
+      responses:
+        '200':
+          description: Listo para recibir tráfico del External Application Load Balancer
+        '503':
+          description: Dependencia crítica no disponible (postura fail-close)
+
+components:
+  securitySchemes:
+    ClientSecretBasic:
+      type: http
+      scheme: basic
+      description: Autenticación HTTP Basic (`client_id:client_secret`) para clientes OIDC confidenciales
+
+  schemas:
+    OpenIdConfigurationDocument:
+      type: object
+      required:
+        - issuer
+        - authorization_endpoint
+        - token_endpoint
+        - jwks_uri
+        - end_session_endpoint
+        - response_types_supported
+        - subject_types_supported
+        - id_token_signing_alg_values_supported
+        - code_challenge_methods_supported
+        - token_endpoint_auth_methods_supported
+        - backchannel_logout_supported
+        - backchannel_logout_session_supported
+      properties:
+        issuer:
+          type: string
+          format: uri
+          example: https://login.sso.educacion.gob.ec
+        authorization_endpoint:
+          type: string
+          format: uri
+          example: https://login.sso.educacion.gob.ec/authorize
+        token_endpoint:
+          type: string
+          format: uri
+          example: https://login.sso.educacion.gob.ec/token
+        jwks_uri:
+          type: string
+          format: uri
+          example: https://login.sso.educacion.gob.ec/jwks
+        end_session_endpoint:
+          type: string
+          format: uri
+          example: https://login.sso.educacion.gob.ec/logout
+        response_types_supported:
+          type: array
+          items:
+            type: string
+            enum: [code]
+        grant_types_supported:
+          type: array
+          items:
+            type: string
+            enum: [authorization_code]
+        subject_types_supported:
+          type: array
+          items:
+            type: string
+            enum: [public]
+        id_token_signing_alg_values_supported:
+          type: array
+          items:
+            type: string
+            enum: [RS256]
+        code_challenge_methods_supported:
+          type: array
+          items:
+            type: string
+            enum: [S256]
+        token_endpoint_auth_methods_supported:
+          type: array
+          items:
+            type: string
+            enum: [client_secret_basic, client_secret_post, none]
+        claims_supported:
+          type: array
+          items:
+            type: string
+          example:
+            - sub
+            - iss
+            - aud
+            - exp
+            - iat
+            - nonce
+            - sid
+            - tipo_identificacion
+            - numero_identificacion
+            - nombre_completo
+            - email
+            - email_verified
+            - hd
+        backchannel_logout_supported:
+          type: boolean
+          example: true
+        backchannel_logout_session_supported:
+          type: boolean
+          example: true
+
+    PublicJwk:
+      type: object
+      required: [kty, use, alg, kid, n, e]
+      properties:
+        kty:
+          type: string
+          enum: [RSA]
+        use:
+          type: string
+          enum: [sig]
+        alg:
+          type: string
+          enum: [RS256]
+        kid:
+          type: string
+          example: sso-oidc-rs256-2026-q4-v1
+        n:
+          type: string
+        e:
+          type: string
+          example: AQAB
+
+    JwksDocument:
+      type: object
+      required: [keys]
+      properties:
+        keys:
+          type: array
+          items:
+            $ref: '#/components/schemas/PublicJwk'
+
+    TokenExchangeRequest:
+      type: object
+      required:
+        - grant_type
+        - code
+        - redirect_uri
+        - code_verifier
+      properties:
+        grant_type:
+          type: string
+          enum: [authorization_code]
+        code:
+          type: string
+          minLength: 16
+        redirect_uri:
+          type: string
+          format: uri
+        client_id:
+          type: string
+        client_secret:
+          type: string
+        code_verifier:
+          type: string
+          minLength: 43
+          maxLength: 128
+
+    TokenExchangeResponse:
+      type: object
+      required:
+        - access_token
+        - token_type
+        - expires_in
+        - id_token
+        - scope
+      properties:
+        access_token:
+          type: string
+        token_type:
+          type: string
+          enum: [Bearer]
+        expires_in:
+          type: integer
+          maximum: 300
+          example: 300
+        id_token:
+          type: string
+          description: |
+            JWT firmado con RS256 por `sso-oidc` (`iss = https://login.sso.<dominio>`, `sub = id_interno`, `aud = client_id` exclusivo, `tipo_identificacion`, `numero_identificacion`, `nombre_completo`, `email`, `hd`). **Garantiza 0 reclamos de roles o permisos (`FR-009`)**.
+        scope:
+          type: string
+          example: openid profile email
+
+    MinedecIdTokenClaims:
+      type: object
+      description: Esquema canónico de reclamos dentro del `id_token` emitido por `sso-oidc` (sin roles ni permisos)
+      required:
+        - iss
+        - sub
+        - aud
+        - iat
+        - exp
+        - sid
+        - tipo_identificacion
+        - numero_identificacion
+        - nombre_completo
+        - email
+        - email_verified
+        - hd
+      additionalProperties: false
+      properties:
+        iss:
+          type: string
+        sub:
+          type: string
+          format: uuid
+        aud:
+          type: string
+        iat:
+          type: integer
+        exp:
+          type: integer
+        auth_time:
+          type: integer
+        nonce:
+          type: string
+        sid:
+          type: string
+        tipo_identificacion:
+          type: string
+          enum: [CEDULA, PASAPORTE, CODIGO_MINEDEC]
+        numero_identificacion:
+          type: string
+        nombre_completo:
+          type: string
+        email:
+          type: string
+          format: email
+        email_verified:
+          type: boolean
+        hd:
+          type: string
+
+    LogoutRequestForm:
+      type: object
+      properties:
+        id_token_hint:
+          type: string
+        client_id:
+          type: string
+        post_logout_redirect_uri:
+          type: string
+          format: uri
+        state:
+          type: string
+
+    LogoutCompletedResponse:
+      type: object
+      required:
+        - status
+        - sessionDestroyed
+        - backchannelNotificationsDispatched
+        - traceId
+      properties:
+        status:
+          type: string
+          enum: [LOGGED_OUT]
+        sessionDestroyed:
+          type: boolean
+        backchannelNotificationsDispatched:
+          type: integer
+        traceId:
+          type: string
+
+    IdentityRevocationEventPayload:
+      type: object
+      required:
+        - alcanceRevocacion
+        - motivoRevocacion
+        - traceId
+      properties:
+        alcanceRevocacion:
+          type: string
+          enum: [CUENTA_INSTITUCIONAL, PERSONA_IDENTIDAD]
+        cuentaId:
+          type: string
+          format: uuid
+        idInterno:
+          type: string
+          format: uuid
+        motivoRevocacion:
+          type: string
+          enum: [SUSPENDIDA_GWS, ELIMINADA_GWS, VIGENCIA_VENCIDA, PERSONA_INACTIVA, BLOQUEADA_ANOMALIA]
+        traceId:
+          type: string
+
+    IdentityRevocationAckResponse:
+      type: object
+      required:
+        - status
+        - sessionsPurged
+        - backchannelLogoutSent
+        - traceId
+      properties:
+        status:
+          type: string
+          enum: [PURGED]
+        sessionsPurged:
+          type: integer
+        backchannelLogoutSent:
+          type: integer
+        traceId:
+          type: string
+
+    RotateJwksKeyRequest:
+      type: object
+      required:
+        - newKid
+        - secretManagerVersion
+        - publicJwk
+      properties:
+        newKid:
+          type: string
+        secretManagerVersion:
+          type: string
+        publicJwk:
+          $ref: '#/components/schemas/PublicJwk'
+        retireExpiredGraceKeys:
+          type: boolean
+          default: true
+
+    RevokeJwksKeyRequest:
+      type: object
+      required:
+        - targetState
+        - reason
+      properties:
+        targetState:
+          type: string
+          enum: [RETIRADA, REVOCADA]
+        reason:
+          type: string
+
+    RotateJwksKeyResponse:
+      type: object
+      required:
+        - activeKid
+        - publishedKids
+        - traceId
+      properties:
+        activeKid:
+          type: string
+          nullable: true
+        publishedKids:
+          type: array
+          items:
+            type: string
+        traceId:
+          type: string
+
+    OAuthTokenErrorResponse:
+      type: object
+      required:
+        - error
+        - error_description
+      properties:
+        error:
+          type: string
+          enum: [invalid_request, invalid_client, invalid_grant, unauthorized_client, unsupported_grant_type]
+        error_description:
+          type: string
+        trace_id:
+          type: string
+
+    OidcSecurityErrorResponse:
+      type: object
+      required:
+        - codigoError
+        - mensajeUsuario
+        - posturaSeguridad
+        - reintentarPermitido
+        - traceId
+      properties:
+        codigoError:
+          type: string
+          enum:
+            - CLIENTE_OIDC_NO_AUTORIZADO
+            - REDIRECT_URI_NO_REGISTRADA
+            - PKCE_S256_OBLIGATORIO
+            - DOMINIO_EXTERNO_RECHAZADO
+            - IDENTIDAD_PENDIENTE_SINCRONIZACION
+            - CUENTA_SUSPENDIDA_O_INACTIVA
+            - DEPENDENCIA_CRITICA_NO_DISPONIBLE
+        mensajeUsuario:
+          type: string
+          description: Mensaje claro en español para el usuario o administrador
+        posturaSeguridad:
+          type: string
+          enum: [FAIL_CLOSE_ACTIVO]
+        reintentarPermitido:
+          type: boolean
+        traceId:
+          type: string
+        diagnosticoAdministrador:
+          type: object
+          properties:
+            queOcurrio:
+              type: string
+            impactoOperativo:
+              type: string
+            accionRecomendada:
+              type: string

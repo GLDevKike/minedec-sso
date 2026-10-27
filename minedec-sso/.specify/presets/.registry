@@ -1,0 +1,23 @@
+{
+  "schema_version": "1.0",
+  "presets": {
+    "minedec-constitution": {
+      "version": "1.3.1",
+      "source": "local",
+      "manifest_hash": "sha256:4c942fcee269fb5184f39ad96914adc5841f89a11cc6697dd7ac5d5e46e29289",
+      "enabled": true,
+      "priority": 10,
+      "registered_commands": {
+        "agy": [
+          "speckit.specify"
+        ]
+      },
+      "registered_skills": {
+        "agy": [
+          "speckit-specify"
+        ]
+      },
+      "installed_at": "2026-10-13T19:26:57.260168+00:00"
+    }
+  }
+}
