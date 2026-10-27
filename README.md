@@ -12,7 +12,6 @@ Guía arquitectónica, operativa y de gobierno del **Sistema de Autenticación C
 4. [Configuración de CI/CD en GitLab con la Service Account Corporativa](#4-configuración-de-cicd-en-gitlab-con-la-service-account-corporativa)
 5. [Segmentación y Manejo de Terraform (`iac-terraform`) en Repositorio Independiente](#5-segmentación-y-manejo-de-terraform-iac-terraform-en-repositorio-independiente)
 6. [Segmentación Oficial de Red en GCP (`/20`, `/23`, `/24`) y Optimización FinOps en `des`](#6-segmentación-oficial-de-red-en-gcp-20-23-24-y-optimización-finops-en-des)
-7. [Sincronización entre los 8 Repositorios de GitLab y el Monorepo de GitHub](#7-sincronización-entre-los-8-repositorios-de-gitlab-y-el-monorepo-de-github)
 
 ---
 
@@ -96,58 +95,45 @@ Desarrollo/                           <-- Directorio de trabajo raíz en Antigra
 
 En Antigravity se agregan como **Active Workspaces** la carpeta raíz `Desarrollo` junto con `minedec-sso`, `iac-terraform` y cada carpeta dentro de `microservicios/*`. Las reglas de [`minedec-sso/AGENTS.md`](./minedec-sso/AGENTS.md) le indican automáticamente al agente que las especificaciones viven en `minedec-sso/specs/00X-slug/`, que la infraestructura vive en `../iac-terraform` y que el código de cada servicio vive en `../microservicios/<servicio>`.
 
-### 3.2 Comandos y Skills de Spec Kit en Antigravity
+### 3.2 Comando `agy` (`--add-dir`) para Dar Acceso a Todos los Directorios y Repositorios
 
-El ciclo de vida de cada requerimiento o ajuste arquitectónico se ejecuta desde `minedec-sso` siguiendo el flujo oficial de **Spec Kit**:
+Al trabajar con repositorios separados (`minedec-sso`, `iac-terraform` y cada servicio en `microservicios/*`), se utiliza el flag repetible `--add-dir` del CLI de Antigravity (`agy`) para montar todos los repositorios como *Active Workspaces* en una misma sesión.
 
-| Orden | Comando / Skill en Antigravity | Propósito y Artefactos que Genera o Actualiza |
-|-------|-------------------------------|-----------------------------------------------|
-| **0** | `/speckit-constitution` | Crea o actualiza principios normativos en `.specify/memory/constitution.md` y sincroniza `AGENTS.md` y las plantillas de `.specify/templates/`. |
-| **1** | `/speckit-specify` | Crea o actualiza `specs/00X-slug/spec.md` con historias de usuario (`US1..USN`), requerimientos funcionales (`FR-XXX`) y criterios de éxito (`SC-XXX`), consultando primero `knowledge/index.md`. |
-| **2** | `/speckit-clarify` | Detecta puntos subespecificados en `spec.md`, formula hasta 5 preguntas de opción múltiple y codifica las respuestas directamente en la sección `Clarifications` de `spec.md`. |
-| **3** | `/speckit-plan` | Consulta obligatoriamente **Google Developer Knowledge (`retrieving-developer-knowledge`)** y genera `plan.md`, `research.md` (con citas `documents/...`), `data-model.md`, `quickstart.md` y `contracts/*.yaml`. |
-| **4** | `/speckit-checklist` | Genera listas de verificación de calidad de requerimientos en `specs/00X-slug/checklists/`. |
-| **5** | `/speckit-tasks` | Genera `specs/00X-slug/tasks.md` ordenado por fases y dependencias, indicando para cada tarea (`T001..T0NN`) la ruta exacta del archivo en `../microservicios/<servicio>` o `../iac-terraform`. |
-| **6** | `/speckit-analyze` | Ejecuta un análisis de consistencia cruzada (solo lectura) entre `constitution.md`, `spec.md`, `plan.md` y `tasks.md`. |
-| **7** | `/speckit-implement` | Ejecuta secuencialmente las tareas de `tasks.md` modificando los repositorios destino (`../microservicios/*`, `../iac-terraform`) y marcando `[X]` en `tasks.md`. |
-| **8** | `/speckit-converge` | Audita el código real de los repositorios frente a `spec.md`, `plan.md` y `tasks.md`; si detecta trabajo faltante, agrega nuevas tareas de convergencia a `tasks.md`. |
-
-### 3.3 Comandos para Mantener la Base de Conocimiento OKF (`knowledge/`)
-
-Cada vez que cambia una decisión arquitectónica, topología de red o esquema en `minedec-sso/knowledge/`, se ejecutan los scripts de la skill `okf-skill`:
+#### Opción A — Iniciando desde la carpeta raíz `Desarrollo/` (PowerShell)
 
 ```powershell
-# 1. Regenerar la tabla de contenidos canónica en knowledge/index.md
-python minedec-sso/.agents/skills/okf-skill/scripts/generate_index.py minedec-sso/knowledge
+cd "C:\Users\anarvaez\Documents\Projects\MINEDEC\SSO\Desarrollo"
 
-# 2. Registrar la entrada de auditoría en knowledge/log.md
-python minedec-sso/.agents/skills/okf-skill/scripts/log_entry.py minedec-sso/knowledge `
-  --type update `
-  --summary "Descripción concisa del cambio arquitectónico" `
-  --paths arquitecturas/infraestructura-permisos-c22.md index.md
-
-# 3. Validar conformidad del bundle OKF (frontmatter YAML, enlaces rotos y huérfanos)
-python minedec-sso/.agents/skills/okf-skill/scripts/validate.py minedec-sso/knowledge
+agy `
+  --add-dir ".\minedec-sso" `
+  --add-dir ".\iac-terraform" `
+  --add-dir ".\microservicios\shared" `
+  --add-dir ".\microservicios\pip-identity-service" `
+  --add-dir ".\microservicios\sincronizador" `
+  --add-dir ".\microservicios\conciliacion-job" `
+  --add-dir ".\microservicios\sso-oidc" `
+  --add-dir ".\microservicios\motor-pdp" `
+  --add-dir ".\Conecta MINEDEC"
 ```
 
-### 3.4 Comandos Git Multi-Repositorio desde la Raíz (`Desarrollo/`)
-
-Al tener 8 repositorios independientes, usamos `-C <ruta>` desde PowerShell en la carpeta raíz `Desarrollo/` para operar sobre cualquiera de ellos o sobre todos en lote sin cambiar de directorio:
+#### Opción B — Iniciando desde `minedec-sso/` (donde reside `AGENTS.md` y `.specify/`)
 
 ```powershell
-# Ver el estado y último commit de los 8 repositorios simultáneamente
-$repos = @("minedec-sso", "iac-terraform", "microservicios/shared", "microservicios/pip-identity-service", "microservicios/sincronizador", "microservicios/conciliacion-job", "microservicios/sso-oidc", "microservicios/motor-pdp")
-foreach ($r in $repos) {
-  Write-Host "=== $r ===" -ForegroundColor Cyan
-  git -C $r status -s
-  git -C $r log -1 --oneline
-}
+cd "C:\Users\anarvaez\Documents\Projects\MINEDEC\SSO\Desarrollo\minedec-sso"
 
-# Subir cambios de un repositorio a las 4 ramas en GitLab disparando UN SOLO pipeline (en develop)
-# Nota: -o ci.skip evita lanzar pipelines duplicados en main, qa y spec/*
-git -C iac-terraform push origin HEAD:develop
-git -C iac-terraform push -o ci.skip origin HEAD:main HEAD:qa HEAD:spec/005-autenticacion-m2m-rotacion
+agy `
+  --add-dir ".." `
+  --add-dir "..\iac-terraform" `
+  --add-dir "..\microservicios\shared" `
+  --add-dir "..\microservicios\pip-identity-service" `
+  --add-dir "..\microservicios\sincronizador" `
+  --add-dir "..\microservicios\conciliacion-job" `
+  --add-dir "..\microservicios\sso-oidc" `
+  --add-dir "..\microservicios\motor-pdp" `
+  --add-dir "..\Conecta MINEDEC"
 ```
+
+> **Tip:** Para reanudar la última conversación manteniendo los directorios agregados, basta con añadir `-c` (o `--continue`) al comando `agy`.
 
 ---
 
@@ -288,43 +274,3 @@ Para minimizar costos durante las pruebas en el ambiente `des` (`mec-003-sso-des
   - **01:00 PM (L–V)**: Apagado (`activationPolicy: NEVER`).
   - **02:00 PM (L–V)**: Encendido (`activationPolicy: ALWAYS`).
   - **05:00 PM (L–V)**: Apagado (`activationPolicy: NEVER`).
-
----
-
-## 7. Sincronización entre los 8 Repositorios de GitLab y el Monorepo de GitHub
-
-Para actualizar este monorepo en GitHub (`https://github.com/GLDevKike/minedec-sso`) en cualquier momento sin tocar los `.git` de los 8 repositorios de GitLab, ejecuta desde la carpeta raíz `Desarrollo/`:
-
-```powershell
-$gitDir = ".github-monorepo.git"
-$repos = @(
-  @{ Path = "minedec-sso"; Ref = "minedec-sso" },
-  @{ Path = "iac-terraform"; Ref = "iac-terraform" },
-  @{ Path = "microservicios/shared"; Ref = "shared" },
-  @{ Path = "microservicios/pip-identity-service"; Ref = "pip-identity-service" },
-  @{ Path = "microservicios/sincronizador"; Ref = "sincronizador" },
-  @{ Path = "microservicios/conciliacion-job"; Ref = "conciliacion-job" },
-  @{ Path = "microservicios/sso-oidc"; Ref = "sso-oidc" },
-  @{ Path = "microservicios/motor-pdp"; Ref = "motor-pdp" }
-)
-
-git --git-dir=$gitDir --work-tree=. read-tree --empty
-foreach ($r in $repos) {
-  $refName = "refs/remotes/local/$($r.Ref)"
-  git --git-dir=$gitDir fetch "./$($r.Path)" "HEAD:$refName"
-  git --git-dir=$gitDir --work-tree=. read-tree --prefix="$($r.Path)/" $refName
-}
-
-$readmeBlob = git --git-dir=$gitDir hash-object -w "README.md"
-git --git-dir=$gitDir update-index --add --cacheinfo "100644,$readmeBlob,README.md"
-
-$treeSha = git --git-dir=$gitDir write-tree
-$parentSha = git --git-dir=$gitDir rev-parse refs/heads/main
-$commitSha = git --git-dir=$gitDir commit-tree $treeSha -p $parentSha -m "chore(monorepo): sincronizar estado de los 8 repositorios con GitHub"
-
-git --git-dir=$gitDir update-ref refs/heads/main $commitSha
-git --git-dir=$gitDir update-ref refs/heads/develop $commitSha
-git --git-dir=$gitDir update-ref refs/heads/qa $commitSha
-git --git-dir=$gitDir update-ref refs/heads/spec/005-autenticacion-m2m-rotacion $commitSha
-git --git-dir=$gitDir push origin main develop qa spec/005-autenticacion-m2m-rotacion
-```
