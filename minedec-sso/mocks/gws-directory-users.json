@@ -1,0 +1,201 @@
+{
+  "kind": "admin#directory#users",
+  "description": "Catálogo local simulado de Google Workspace Admin SDK Directory API (v1, projection=full, customSchemas.MINEDEC_Perfil) para pruebas locales sin conexión a Google Workspace.",
+  "users": [
+    {
+      "kind": "admin#directory#user",
+      "id": "105000000000000000001",
+      "primaryEmail": "carlos.quito@educacion.gob.ec",
+      "name": {
+        "givenName": "Carlos",
+        "familyName": "Quito",
+        "fullName": "Carlos Quito"
+      },
+      "orgUnitPath": "/Docentes",
+      "suspended": false,
+      "archived": false,
+      "lastLoginTime": "2026-10-20T12:00:00.000Z",
+      "customSchemas": {
+        "MINEDEC_Perfil": {
+          "idInterno": null,
+          "tipoIdentificacion": "CEDULA",
+          "numeroIdentificacion": "1710034065",
+          "fechaNacimiento": "1985-04-12",
+          "tipoUsuario": "DOCENTE_ADMINISTRATIVO",
+          "subtipoUsuario": "DOCENTE_NOMBRAMIENTO",
+          "cargoFuncion": "DOCENTE_AULA",
+          "nivelEstructura": "INSTITUCION_EDUCATIVA",
+          "zonaDistritoCircuito": "Z09-17D05-17D05C01",
+          "viceministerio": null,
+          "codigoInstitucion": "17H00123",
+          "codigoDependenciaAdmin": null,
+          "regimenEscolar": "SIERRA_AMAZONIA",
+          "nivelAcademico": "BGU",
+          "gradoCurso": "1BGU",
+          "modalidadEducativa": "PRESENCIAL",
+          "jornada": "MATUTINA",
+          "docenteMultisede": false,
+          "representanteLegalCedula": null,
+          "fechaInicioVigencia": "2020-09-01",
+          "fechaFinVigencia": null
+        }
+      }
+    },
+    {
+      "kind": "admin#directory#user",
+      "id": "105000000000000000002",
+      "primaryEmail": "carlos.quito@docentes.educacion.gob.ec",
+      "name": {
+        "givenName": "Carlos",
+        "familyName": "Quito",
+        "fullName": "Carlos Quito"
+      },
+      "orgUnitPath": "/Docentes",
+      "suspended": false,
+      "archived": false,
+      "lastLoginTime": "2026-10-20T12:05:00.000Z",
+      "customSchemas": {
+        "MINEDEC_Perfil": {
+          "idInterno": null,
+          "tipoIdentificacion": "CEDULA",
+          "numeroIdentificacion": "1710034065",
+          "fechaNacimiento": "1985-04-12",
+          "tipoUsuario": "DOCENTE",
+          "subtipoUsuario": "DOCENTE_NOMBRAMIENTO",
+          "cargoFuncion": "DOCENTE_AULA",
+          "nivelEstructura": "INSTITUCION_EDUCATIVA",
+          "zonaDistritoCircuito": "Z09-17D05-17D05C01",
+          "viceministerio": null,
+          "codigoInstitucion": "17H00123",
+          "codigoDependenciaAdmin": null,
+          "regimenEscolar": "SIERRA_AMAZONIA",
+          "nivelAcademico": "BGU",
+          "gradoCurso": "2BGU",
+          "modalidadEducativa": "PRESENCIAL",
+          "jornada": "VESPERTINA",
+          "docenteMultisede": true,
+          "representanteLegalCedula": null,
+          "fechaInicioVigencia": "2024-09-01",
+          "fechaFinVigencia": null
+        }
+      }
+    },
+    {
+      "kind": "admin#directory#user",
+      "id": "105000000000000000003",
+      "primaryEmail": "maria.loja@estudiantes.educacion.gob.ec",
+      "name": {
+        "givenName": "María",
+        "familyName": "Loja",
+        "fullName": "María Loja"
+      },
+      "orgUnitPath": "/Estudiantes/Zona09",
+      "suspended": false,
+      "archived": false,
+      "lastLoginTime": "2026-10-20T13:10:00.000Z",
+      "customSchemas": {
+        "MINEDEC_Perfil": {
+          "idInterno": null,
+          "tipoIdentificacion": "CEDULA",
+          "numeroIdentificacion": "1104680135",
+          "fechaNacimiento": "2010-05-14",
+          "tipoUsuario": "ESTUDIANTE",
+          "subtipoUsuario": "ESTUDIANTE_REGULAR",
+          "cargoFuncion": null,
+          "nivelEstructura": "INSTITUCION_EDUCATIVA",
+          "zonaDistritoCircuito": "Z09-17D05-17D05C01",
+          "viceministerio": null,
+          "codigoInstitucion": "17H00123",
+          "codigoDependenciaAdmin": null,
+          "regimenEscolar": "SIERRA_AMAZONIA",
+          "nivelAcademico": "BGU",
+          "gradoCurso": "1BGU",
+          "modalidadEducativa": "PRESENCIAL",
+          "jornada": "MATUTINA",
+          "docenteMultisede": false,
+          "representanteLegalCedula": "1710034065",
+          "fechaInicioVigencia": "2026-09-01",
+          "fechaFinVigencia": "2027-07-15"
+        }
+      }
+    },
+    {
+      "kind": "admin#directory#user",
+      "id": "105000000000000000004",
+      "primaryEmail": "ana.cuenca@educacion.gob.ec",
+      "name": {
+        "givenName": "Ana",
+        "familyName": "Cuenca",
+        "fullName": "Ana Cuenca"
+      },
+      "orgUnitPath": "/Administrativos",
+      "suspended": false,
+      "archived": false,
+      "lastLoginTime": "2026-10-20T14:00:00.000Z",
+      "customSchemas": {
+        "MINEDEC_Perfil": {
+          "idInterno": null,
+          "tipoIdentificacion": "CEDULA",
+          "numeroIdentificacion": "0102030405",
+          "fechaNacimiento": "1990-11-20",
+          "tipoUsuario": "ADMINISTRATIVO",
+          "subtipoUsuario": "ADMIN_LOSEP",
+          "cargoFuncion": "ANALISTA_CENTRAL",
+          "nivelEstructura": "PLANTA_CENTRAL",
+          "zonaDistritoCircuito": null,
+          "viceministerio": "EDUCACION",
+          "codigoInstitucion": null,
+          "codigoDependenciaAdmin": "DNTI-001",
+          "regimenEscolar": null,
+          "nivelAcademico": null,
+          "gradoCurso": null,
+          "modalidadEducativa": null,
+          "jornada": null,
+          "docenteMultisede": false,
+          "representanteLegalCedula": null,
+          "fechaInicioVigencia": "2022-01-10",
+          "fechaFinVigencia": null
+        }
+      }
+    },
+    {
+      "kind": "admin#directory#user",
+      "id": "105000000000000000005",
+      "primaryEmail": "usuario.anomalia@educacion.gob.ec",
+      "name": {
+        "givenName": "Pedro",
+        "familyName": "Anomalía",
+        "fullName": "Pedro Anomalía"
+      },
+      "orgUnitPath": "/Docentes",
+      "suspended": false,
+      "archived": false,
+      "lastLoginTime": "2026-10-20T14:30:00.000Z",
+      "customSchemas": {
+        "MINEDEC_Perfil": {
+          "idInterno": null,
+          "tipoIdentificacion": "CEDULA",
+          "numeroIdentificacion": "1234567890",
+          "fechaNacimiento": "1988-01-01",
+          "tipoUsuario": "DOCENTE",
+          "subtipoUsuario": "CONTRATO_OCASIONAL",
+          "cargoFuncion": "DOCENTE_AULA",
+          "nivelEstructura": "INSTITUCION_EDUCATIVA",
+          "zonaDistritoCircuito": "Z09-17D05-17D05C01",
+          "viceministerio": null,
+          "codigoInstitucion": null,
+          "codigoDependenciaAdmin": null,
+          "regimenEscolar": "SIERRA_AMAZONIA",
+          "nivelAcademico": null,
+          "gradoCurso": null,
+          "modalidadEducativa": "PRESENCIAL",
+          "jornada": "MATUTINA",
+          "docenteMultisede": false,
+          "representanteLegalCedula": null,
+          "fechaInicioVigencia": null,
+          "fechaFinVigencia": null
+        }
+      }
+    }
+  ]
+}

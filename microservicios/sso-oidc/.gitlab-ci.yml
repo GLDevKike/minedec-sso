@@ -1,0 +1,54 @@
+# Pipeline CI/CD de Microservicio: sso-oidc (GitLab CI — Subcomponente C2.2)
+# Ejecutado por el GitLab Runner institucional con identidad adjunta:
+# gitlab-runner@gitlab-servinformacion.iam.gserviceaccount.com (Metadata Server, cero llaves JSON)
+
+stages:
+  - quality
+  - test
+  - package
+
+variables:
+  GCP_REGION: "us-east1"
+  GAR_REPOSITORY: "sso-containers"
+  SERVICE_NAME: "sso-oidc"
+  RUNTIME_SA_NAME: "sa-sso-core"
+
+default:
+  image: node:22-alpine
+
+lint_and_sast:
+  stage: quality
+  script:
+    - npm ci
+    - npm run lint
+    - npm audit --audit-level=high
+
+unit_and_integration_tests:
+  stage: test
+  script:
+    - npm ci
+    - npm run build
+    - npm run test:coverage
+  coverage: '/All files[^|]*\|[^|]*\s+([\d\.]+)/'
+
+build_and_push_image:
+  stage: package
+  image: google/cloud-sdk:alpine
+  rules:
+    - if: '$CI_COMMIT_BRANCH =~ /^(main|qa|develop|release\/.*)$/'
+    - if: '$CI_COMMIT_BRANCH =~ /^spec\//'
+      when: manual
+      allow_failure: true
+  script:
+    - |
+      if [ "$CI_COMMIT_BRANCH" = "main" ]; then
+        GCP_PROJECT_ID="mec-003-sso-pro"
+      elif [ "$CI_COMMIT_BRANCH" = "qa" ] || [[ "$CI_COMMIT_BRANCH" =~ ^release/.* ]]; then
+        GCP_PROJECT_ID="mec-003-sso-pre"
+      else
+        GCP_PROJECT_ID="mec-003-sso-des"
+      fi
+    - gcloud auth configure-docker "${GCP_REGION}-docker.pkg.dev" --quiet
+    - IMAGE_URI="${GCP_REGION}-docker.pkg.dev/${GCP_PROJECT_ID}/${GAR_REPOSITORY}/${SERVICE_NAME}:${CI_COMMIT_SHA}"
+    - docker build --build-arg SHARED_NPM_PROJECT_ID="${SHARED_NPM_PROJECT_ID}" --build-arg CI_JOB_TOKEN="${CI_JOB_TOKEN}" -t "${IMAGE_URI}" .
+    - docker push "${IMAGE_URI}"

@@ -1,0 +1,72 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: conecta-minedec-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-conecta_minedec_pip}
+      POSTGRES_USER: ${POSTGRES_USER:-minedec_pip_app}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-local_dev_only_change_me}
+    ports:
+      - "${POSTGRES_PORT:-5433}:5432"
+    volumes:
+      - ./migrations:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-minedec_pip_app} -d ${POSTGRES_DB:-conecta_minedec_pip}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    container_name: conecta-minedec-redis
+    restart: unless-stopped
+    command: ["redis-server", "--appendonly", "no", "--maxmemory", "256mb", "--maxmemory-policy", "allkeys-lru"]
+    ports:
+      - "${REDIS_PORT:-6379}:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  pip-identity-service:
+    build:
+      context: .
+      dockerfile: backend/pip-identity-service/Dockerfile
+    container_name: conecta-minedec-pip
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    environment:
+      NODE_ENV: development
+      PORT: 8080
+      DATABASE_URL: postgresql://${POSTGRES_USER:-minedec_pip_app}:${POSTGRES_PASSWORD:-local_dev_only_change_me}@postgres:5432/${POSTGRES_DB:-conecta_minedec_pip}
+      REDIS_URL: redis://redis:6379
+    ports:
+      - "${PIP_HOST_PORT:-8091}:8080"
+
+  sincronizador:
+    build:
+      context: .
+      dockerfile: backend/sincronizador/Dockerfile
+    container_name: conecta-minedec-sincronizador
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    environment:
+      NODE_ENV: development
+      PORT: 8080
+      DATABASE_URL: postgresql://${POSTGRES_USER:-minedec_pip_app}:${POSTGRES_PASSWORD:-local_dev_only_change_me}@postgres:5432/${POSTGRES_DB:-conecta_minedec_pip}
+      REDIS_URL: redis://redis:6379
+      GWS_MOCK_CATALOG_PATH: /app/mocks/gws-directory-users.json
+    volumes:
+      - ./mocks:/app/mocks:ro
+    ports:
+      - "${SYNC_HOST_PORT:-8092}:8080"

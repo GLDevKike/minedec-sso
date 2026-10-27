@@ -1,0 +1,77 @@
+{
+  "version": 1,
+  "skills": {
+    "cloud-build-basics": {
+      "source": "google/skills",
+      "sourceType": "github",
+      "skillPath": "skills/cloud/cloud-build-basics/SKILL.md",
+      "computedHash": "ccc36a906c1fdd7de642fed0a2518f58cba5e5f8a8e91de2865966df3e2ef25e"
+    },
+    "cloud-run-alert-configuration": {
+      "source": "google/skills",
+      "sourceType": "github",
+      "skillPath": "skills/cloud/cloud-run-alert-configuration/SKILL.md",
+      "computedHash": "b3d1f554b9cd37477d02a3b0a33dce9f475e40f9f7fe9696ab2a8e7bbf9ead6e"
+    },
+    "cloud-run-basics": {
+      "source": "google/skills",
+      "sourceType": "github",
+      "skillPath": "skills/cloud/cloud-run-basics/SKILL.md",
+      "computedHash": "d8b8fa8d38255d5f377d0c590d3ea0a420437eeb6cbd6f2ffe80050619bf3e01"
+    },
+    "google-cloud-global-frontend-configuration": {
+      "source": "google/skills",
+      "sourceType": "github",
+      "skillPath": "skills/cloud/google-cloud-global-frontend-configuration/SKILL.md",
+      "computedHash": "7a829ab80fa20862040d22f21cc1ac256481f95ca9bed776e464fbaf19b0d396"
+    },
+    "iam-helper-for-policy-management": {
+      "source": "google/skills",
+      "sourceType": "github",
+      "skillPath": "skills/cloud/iam-helper-for-policy-management/SKILL.md",
+      "computedHash": "ba6e08793aa2d6c5338d6e7a9b267dd49b7de704ea0c5aef7135b5e9a5430e5e"
+    },
+    "iam-helper-for-privileged-access-management": {
+      "source": "google/skills",
+      "sourceType": "github",
+      "skillPath": "skills/cloud/iam-helper-for-privileged-access-management/SKILL.md",
+      "computedHash": "75b2d89b5c430df74c8a44bd18a317b45799d3757232b6fe61d38949a27ad0b9"
+    },
+    "iam-helper-for-troubleshooting": {
+      "source": "google/skills",
+      "sourceType": "github",
+      "skillPath": "skills/cloud/iam-helper-for-troubleshooting/SKILL.md",
+      "computedHash": "92dac4da9bb31f78b352758f200554b612a449716e4f888000ab414b1acf1eb9"
+    },
+    "okf-skill": {
+      "source": "rakibtg/okf-skill",
+      "sourceType": "github",
+      "skillPath": "skills/okf-skill/SKILL.md",
+      "computedHash": "0607485ab6572a1af63c67eff4b6a5aef9bf9d98c3b519b27e9a11e55a411c6b"
+    },
+    "refactor-module": {
+      "source": "hashicorp/agent-skills",
+      "sourceType": "github",
+      "skillPath": "plugins/terraform/skills/refactor-module/SKILL.md",
+      "computedHash": "8c99d8ef94377f9d6170c496d3516f1fc0a1c2a592c107be7dad32ba62382110"
+    },
+    "retrieving-developer-knowledge": {
+      "source": "google/skills",
+      "sourceType": "github",
+      "skillPath": "skills/developers/retrieving-developer-knowledge/SKILL.md",
+      "computedHash": "39a93ca8021bbb6a4160a82c9dccecd6135ffcc691941fa35e51af05cb7e7b41"
+    },
+    "terraform-style-guide": {
+      "source": "hashicorp/agent-skills",
+      "sourceType": "github",
+      "skillPath": "plugins/terraform/skills/terraform-style-guide/SKILL.md",
+      "computedHash": "b47790ecc50d56cba8970b8d9814e96d624cdd64a22a38118d11a554836cd768"
+    },
+    "terraform-test": {
+      "source": "hashicorp/agent-skills",
+      "sourceType": "github",
+      "skillPath": "plugins/terraform/skills/terraform-test/SKILL.md",
+      "computedHash": "c9e257250e14ea71e522e131a4a63a65434360fe3a0635c8bf8a49ca5529e2cd"
+    }
+  }
+}

@@ -1,0 +1,9 @@
+src/
+tests/
+coverage/
+jest.config.ts
+tsconfig.json
+eslint.config.mjs
+.gitlab-ci.yml
+*.spec.ts
+*.test.ts

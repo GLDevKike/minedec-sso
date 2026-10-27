@@ -1,0 +1,194 @@
+# ─────────────────────────────────────────────
+# CI/CD de Infraestructura — MINEDEC Subcomponente C2.2 (SSO)
+#
+# El runner corre en una VM con la service account
+# gitlab-runner@gitlab-servinformacion.iam.gserviceaccount.com adjunta, por lo que
+# gcloud se autentica mediante el metadata server (cero llaves JSON en el pipeline).
+#
+# Flujo:
+#   validate → fmt + validate de cada bundle (Terraform 1.5.7, igual que Infra Manager)
+#   preview  → solo en merge requests: gcloud infra-manager previews create
+#   deploy   → solo en develop, manual y por stack: gcloud infra-manager deployments apply
+#
+# Nota: La Shared VPC reside en mec-003-sha-net-{des,pre,pro-511014} y es
+# administrada por el equipo de redes. Este repositorio despliega únicamente los
+# tres stacks del proyecto de servicio SSO: devops → data → apps.
+# ─────────────────────────────────────────────
+
+stages:
+  - validate
+  - preview
+  - deploy
+
+variables:
+  GCP_SSO_PROJECT: "mec-003-sso-des"
+  IM_LOCATION: "us-east1"
+  IM_SERVICE_ACCOUNT: "projects/mec-003-sso-des/serviceAccounts/sa-infra-manager@mec-003-sso-des.iam.gserviceaccount.com"
+  IM_ARTIFACTS_BUCKET: "gs://mec-003-sso-des-im-artifacts"
+
+  # Ambiente y prefijo de los nombres de deployment en Infra Manager
+  AMBIENTE: "des"
+  IM_DEPLOYMENT_PREFIX: "sso-des"
+
+  # Debe coincidir con required_version de las raíces de despliegue
+  TF_VERSION: "1.5.7"
+
+  CLOUDSDK_CORE_PROJECT: "mec-003-sso-des"
+
+# ─────────────────────────────────────────────
+# VALIDATE — un job por stack (devops, data, apps)
+# ─────────────────────────────────────────────
+
+.validate:
+  stage: validate
+  image: hashicorp/terraform:1.5.7
+  before_script:
+    - apk add --no-cache bash
+  script:
+    - bash scripts/bundle.sh "$AMBIENTE" "$STACK"
+    - terraform fmt -recursive -check -diff modulos plantillas despliegues
+    - terraform -chdir="build/$STACK" init -backend=false -input=false
+    - terraform -chdir="build/$STACK" validate
+  artifacts:
+    paths:
+      - build/$STACK
+    expire_in: 1 day
+
+validate:devops:
+  extends: .validate
+  variables:
+    STACK: devops
+
+validate:data:
+  extends: .validate
+  variables:
+    STACK: data
+
+validate:apps:
+  extends: .validate
+  variables:
+    STACK: apps
+
+# ─────────────────────────────────────────────
+# PREVIEW — plan gestionado por Infra Manager, solo en merge requests
+# ─────────────────────────────────────────────
+
+.preview:
+  stage: preview
+  image: google/cloud-sdk:slim
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+  script:
+    - bash scripts/bundle.sh "$AMBIENTE" "$STACK"
+    - export FUENTE="${IM_ARTIFACTS_BUCKET}/fuentes/${IM_DEPLOYMENT_PREFIX}-${STACK}/${CI_PIPELINE_ID}-${CI_JOB_ID}"
+    - gcloud storage cp -r "build/${STACK}/*" "${FUENTE}/"
+    - export PREVIEW_ID="${IM_DEPLOYMENT_PREFIX}-${STACK}-mr${CI_MERGE_REQUEST_IID}-${CI_COMMIT_SHORT_SHA}"
+    - |
+      gcloud infra-manager previews create \
+        "projects/${GCP_SSO_PROJECT}/locations/${IM_LOCATION}/previews/${PREVIEW_ID}" \
+        --deployment="projects/${GCP_SSO_PROJECT}/locations/${IM_LOCATION}/deployments/${IM_DEPLOYMENT_PREFIX}-${STACK}" \
+        --service-account="${IM_SERVICE_ACCOUNT}" \
+        --gcs-source="${FUENTE}" \
+        --inputs-file="build/${STACK}/terraform.tfvars" \
+        --artifacts-gcs-bucket="${IM_ARTIFACTS_BUCKET}"
+  after_script:
+    - export PREVIEW_ID="${IM_DEPLOYMENT_PREFIX}-${STACK}-mr${CI_MERGE_REQUEST_IID}-${CI_COMMIT_SHORT_SHA}"
+    - |
+      gcloud infra-manager previews delete \
+        "projects/${GCP_SSO_PROJECT}/locations/${IM_LOCATION}/previews/${PREVIEW_ID}" \
+        --quiet || true
+
+preview:devops:
+  extends: .preview
+  needs: ["validate:devops"]
+  variables:
+    STACK: devops
+
+preview:data:
+  extends: .preview
+  needs: ["validate:data"]
+  variables:
+    STACK: data
+
+preview:apps:
+  extends: .preview
+  needs: ["validate:apps"]
+  variables:
+    STACK: apps
+
+# ─────────────────────────────────────────────
+# DEPLOY — manual y por stack en develop (des), qa (pre) y main (pro)
+#
+# Orden recomendado: devops → data → apps.
+# ─────────────────────────────────────────────
+
+.deploy:
+  stage: deploy
+  image: google/cloud-sdk:slim
+  rules:
+    - if: $CI_COMMIT_BRANCH == "develop"
+      variables:
+        AMBIENTE: "des"
+        GCP_SSO_PROJECT: "mec-003-sso-des"
+        IM_DEPLOYMENT_PREFIX: "sso-des"
+        IM_SERVICE_ACCOUNT: "projects/mec-003-sso-des/serviceAccounts/sa-infra-manager@mec-003-sso-des.iam.gserviceaccount.com"
+        IM_ARTIFACTS_BUCKET: "gs://mec-003-sso-des-im-artifacts"
+        CLOUDSDK_CORE_PROJECT: "mec-003-sso-des"
+      when: manual
+      allow_failure: false
+    - if: $CI_COMMIT_BRANCH == "qa"
+      variables:
+        AMBIENTE: "pre"
+        GCP_SSO_PROJECT: "mec-003-sso-pre"
+        IM_DEPLOYMENT_PREFIX: "sso-pre"
+        IM_SERVICE_ACCOUNT: "projects/mec-003-sso-pre/serviceAccounts/sa-infra-manager@mec-003-sso-pre.iam.gserviceaccount.com"
+        IM_ARTIFACTS_BUCKET: "gs://mec-003-sso-pre-im-artifacts"
+        CLOUDSDK_CORE_PROJECT: "mec-003-sso-pre"
+      when: manual
+      allow_failure: false
+    - if: $CI_COMMIT_BRANCH == "main"
+      variables:
+        AMBIENTE: "pro"
+        GCP_SSO_PROJECT: "mec-003-sso-pro"
+        IM_DEPLOYMENT_PREFIX: "sso-pro"
+        IM_SERVICE_ACCOUNT: "projects/mec-003-sso-pro/serviceAccounts/sa-infra-manager@mec-003-sso-pro.iam.gserviceaccount.com"
+        IM_ARTIFACTS_BUCKET: "gs://mec-003-sso-pro-im-artifacts"
+        CLOUDSDK_CORE_PROJECT: "mec-003-sso-pro"
+      when: manual
+      allow_failure: false
+  script:
+    - bash scripts/bundle.sh "$AMBIENTE" "$STACK"
+    - export FUENTE="${IM_ARTIFACTS_BUCKET}/fuentes/${IM_DEPLOYMENT_PREFIX}-${STACK}/${CI_PIPELINE_ID}-${CI_JOB_ID}"
+    - gcloud storage cp -r "build/${STACK}/*" "${FUENTE}/"
+    - |
+      gcloud infra-manager deployments apply \
+        "projects/${GCP_SSO_PROJECT}/locations/${IM_LOCATION}/deployments/${IM_DEPLOYMENT_PREFIX}-${STACK}" \
+        --service-account="${IM_SERVICE_ACCOUNT}" \
+        --gcs-source="${FUENTE}" \
+        --inputs-file="build/${STACK}/terraform.tfvars" \
+        --artifacts-gcs-bucket="${IM_ARTIFACTS_BUCKET}" \
+        --tf-version-constraint="=${TF_VERSION}"
+    - |
+      gcloud infra-manager deployments describe \
+        "projects/${GCP_SSO_PROJECT}/locations/${IM_LOCATION}/deployments/${IM_DEPLOYMENT_PREFIX}-${STACK}" \
+        --format="value(state,latestRevision)"
+  environment:
+    name: $AMBIENTE/$STACK
+
+deploy:devops:
+  extends: .deploy
+  needs: ["validate:devops"]
+  variables:
+    STACK: devops
+
+deploy:data:
+  extends: .deploy
+  needs: ["validate:data", "deploy:devops"]
+  variables:
+    STACK: data
+
+deploy:apps:
+  extends: .deploy
+  needs: ["validate:apps", "deploy:data"]
+  variables:
+    STACK: apps

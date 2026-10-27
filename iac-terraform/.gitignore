@@ -1,0 +1,22 @@
+# Terraform
+.terraform/
+.terraform.lock.hcl
+*.tfstate
+*.tfstate.*
+crash.log
+crash.*.log
+override.tf
+override.tf.json
+*_override.tf
+*_override.tf.json
+*.tfplan
+
+# Bundles generados por scripts/bundle.sh
+build/
+
+# Copia de referencia de los módulos de otro proyecto (no forma parte del repo)
+ref/
+
+# Nunca deben versionarse: pueden contener secretos
+*.auto.tfvars
+*.tfvars.json
