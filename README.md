@@ -2,8 +2,6 @@
 
 Guía arquitectónica, operativa y de gobierno del **Sistema de Autenticación Centralizado SSO / Conecta MINEDEC (Subcomponente C2.2)** bajo la **Constitución MINEDEC v2.11.0**.
 
-> **Nota sobre este repositorio en GitHub:** Este repositorio (`GLDevKike/minedec-sso`) actúa como un **monorepo espejo unificado** (ensamblado sin submódulos mediante `git read-tree --prefix`) de los **8 repositorios independientes** que operan en la instancia empresarial de GitLab (`https://git.sitimapa.co/ministerio-de-educaci-n-deporte-y-cultura-de-ecuador/c2-sso`).
-
 ---
 
 ## Tabla de Contenidos
